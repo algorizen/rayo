@@ -38,9 +38,12 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      # uv here only provides a Python for pyo3 to link against; nothing is
+      # uv-installed, so the download cache must be off or the post-step fails.
       - uses: astral-sh/setup-uv@v6
         with:
           python-version: ${{ env.PYTHON_DEFAULT }}
+          enable-cache: false
       - run: cargo test --workspace
 
   python-tests:
@@ -67,13 +70,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Build a manylinux wheel + sdist
+      - name: Build manylinux wheels + sdist
         uses: PyO3/maturin-action@v1
         with:
           command: build
-          args: --release --out dist --sdist
+          # One GIL and one free-threaded wheel — a dry run of the release path.
+          args: --release --out dist --sdist --interpreter 3.12 3.14t
           manylinux: auto
-      - name: Install the wheel and import it
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install the cp312 wheel and import it
         run: |
-          python3 -m pip install --no-index --find-links dist rayo
-          python3 -c "import rayo; print('rayo', rayo.__version__, 'imports OK')"
+          python -m pip install --only-binary ':all:' --no-index --find-links dist rayo
+          python -c "import rayo; print('rayo', rayo.__version__, 'imports OK')"
