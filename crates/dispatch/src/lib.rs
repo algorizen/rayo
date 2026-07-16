@@ -14,8 +14,8 @@
 //! will be confined; every `unsafe` block requires a `// SAFETY:` comment.
 //! (v1 contains none.)
 
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use pyo3::prelude::*;
@@ -87,6 +87,7 @@ fn report_handler_error(py: Python<'_>, error: PyErr) -> HandlerResponse {
 #[pyclass(frozen)]
 pub struct CompletionCallback {
     response_sender: Mutex<Option<oneshot::Sender<HandlerResponse>>>,
+    in_flight: Arc<AtomicUsize>,
 }
 
 impl CompletionCallback {
@@ -96,6 +97,9 @@ impl CompletionCallback {
             .lock()
             .unwrap_or_else(|poisoned_lock| poisoned_lock.into_inner());
         if let Some(sender) = sender_slot.take() {
+            // The `take` above fires at most once per request, so this
+            // decrement exactly balances the increment in `schedule`.
+            self.in_flight.fetch_sub(1, Ordering::Relaxed);
             // The receiver disappearing just means the client went away.
             let _ = sender.send(response);
         }
@@ -118,6 +122,10 @@ pub struct EventLoop {
     loop_object: Py<PyAny>,
     spawn_helper: Py<PyAny>,
     thread: Mutex<Option<JoinHandle<()>>>,
+    /// Requests scheduled but not yet completed — the load signal for
+    /// least-loaded placement, and an ops gauge. Heuristic: `Relaxed`
+    /// everywhere, exactness is not required for either use.
+    in_flight: Arc<AtomicUsize>,
 }
 
 impl EventLoop {
@@ -159,7 +167,12 @@ impl EventLoop {
             loop_object: loop_object.unbind(),
             spawn_helper: spawn_helper.unbind(),
             thread: Mutex::new(Some(thread)),
+            in_flight: Arc::new(AtomicUsize::new(0)),
         })
+    }
+
+    pub fn in_flight_count(&self) -> usize {
+        self.in_flight.load(Ordering::Relaxed)
     }
 
     /// Schedule an async handler onto the event loop. Always resolves the
@@ -171,15 +184,18 @@ impl EventLoop {
         handler_kwargs: Bound<'_, PyDict>,
     ) -> oneshot::Receiver<HandlerResponse> {
         let (response_sender, response_receiver) = oneshot::channel();
+        self.in_flight.fetch_add(1, Ordering::Relaxed);
         let completion = match Py::new(
             py,
             CompletionCallback {
                 response_sender: Mutex::new(Some(response_sender)),
+                in_flight: Arc::clone(&self.in_flight),
             },
         ) {
             Ok(callback) => callback,
             Err(allocation_error) => {
                 allocation_error.print(py);
+                self.in_flight.fetch_sub(1, Ordering::Relaxed);
                 return response_receiver; // sender dropped → receiver errors → 500
             }
         };
@@ -231,11 +247,12 @@ impl EventLoop {
 
 /// N event loops on N threads, one intended per core on free-threaded builds
 /// (where they run Python truly in parallel) and one total on GIL builds.
-/// Requests distribute round-robin; the pool is `Sync` and lock-free on the
-/// scheduling path (invariant 4).
+/// Requests go to the least-loaded loop (in-flight count, scan started at a
+/// rotating offset so ties spread instead of piling onto loop 0). The pool is
+/// `Sync` and lock-free on the scheduling path (invariant 4).
 pub struct EventLoopPool {
     loops: Vec<EventLoop>,
-    next_loop_index: AtomicUsize,
+    scan_start_index: AtomicUsize,
 }
 
 impl EventLoopPool {
@@ -254,7 +271,7 @@ impl EventLoopPool {
         }
         Ok(Self {
             loops,
-            next_loop_index: AtomicUsize::new(0),
+            scan_start_index: AtomicUsize::new(0),
         })
     }
 
@@ -262,15 +279,34 @@ impl EventLoopPool {
         self.loops.len()
     }
 
-    /// Schedule onto the next loop, round-robin.
+    /// Requests scheduled but not yet completed, across all loops.
+    pub fn total_in_flight(&self) -> usize {
+        self.loops.iter().map(EventLoop::in_flight_count).sum()
+    }
+
+    /// Schedule onto the least-loaded loop.
     pub fn schedule(
         &self,
         py: Python<'_>,
         handler: &Py<PyAny>,
         handler_kwargs: Bound<'_, PyDict>,
     ) -> oneshot::Receiver<HandlerResponse> {
-        let loop_index = self.next_loop_index.fetch_add(1, Ordering::Relaxed) % self.loops.len();
-        self.loops[loop_index].schedule(py, handler, handler_kwargs)
+        let loop_count = self.loops.len();
+        let scan_start = self.scan_start_index.fetch_add(1, Ordering::Relaxed);
+        let mut chosen_index = scan_start % loop_count;
+        let mut lowest_load = self.loops[chosen_index].in_flight_count();
+        for scan_offset in 1..loop_count {
+            if lowest_load == 0 {
+                break; // an idle loop cannot be beaten
+            }
+            let candidate_index = (scan_start + scan_offset) % loop_count;
+            let candidate_load = self.loops[candidate_index].in_flight_count();
+            if candidate_load < lowest_load {
+                chosen_index = candidate_index;
+                lowest_load = candidate_load;
+            }
+        }
+        self.loops[chosen_index].schedule(py, handler, handler_kwargs)
     }
 
     /// Stop every loop and join its thread. Idempotent.

@@ -285,6 +285,13 @@ impl Server {
         self.port
     }
 
+    /// Async requests currently being handled (scheduled, not yet completed).
+    /// A live ops gauge; approximate under concurrency by nature.
+    #[getter]
+    fn in_flight(&self) -> usize {
+        self.service.event_loops.total_in_flight()
+    }
+
     /// Block until Ctrl+C (or a `shutdown()` from another thread), then shut
     /// down gracefully.
     fn wait(&self, py: Python<'_>) {

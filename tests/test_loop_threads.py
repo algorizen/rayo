@@ -59,6 +59,22 @@ def test_rejects_zero_loop_threads() -> None:
         app._start(port=0, loop_threads=0)
 
 
+def test_in_flight_gauge_drains_to_zero(running_server: Server) -> None:
+    with ThreadPoolExecutor(max_workers=8) as request_pool:
+        burst_futures = [
+            request_pool.submit(_get_json, running_server.port, "/burn/20") for _ in range(16)
+        ]
+        for burst_future in burst_futures:
+            burst_future.result()
+
+    # The gauge decrements on the loop thread as each completion callback
+    # runs, which can trail the client seeing its response; poll briefly.
+    drain_deadline = time.perf_counter() + 5
+    while running_server.in_flight != 0 and time.perf_counter() < drain_deadline:
+        time.sleep(0.01)
+    assert running_server.in_flight == 0
+
+
 def test_requests_distribute_across_all_loop_threads(running_server: Server) -> None:
     serving_threads = {
         str(_get_json(running_server.port, "/loop-thread")["thread"])
