@@ -168,9 +168,11 @@ impl RequestService for AppService {
 
         if route.is_async {
             // The single attach for this request: build inputs, hand the
-            // coroutine to the event loop, leave. The response arrives as
-            // bytes through the channel.
-            let response_receiver =
+            // handler coroutine to the scheduler, leave. The response arrives
+            // as bytes through the channel. If Hyper drops the future before
+            // it resolves (client disconnect), dropping the dispatched
+            // request cancels the handler.
+            let dispatch_outcome =
                 Python::attach(
                     |py| match self.build_kwargs(py, route, &route_match.path_params) {
                         Ok(kwargs) => Ok(self.event_loops.schedule(py, &route.handler, kwargs)),
@@ -178,10 +180,10 @@ impl RequestService for AppService {
                     },
                 );
             Box::pin(async move {
-                match response_receiver {
-                    Ok(receiver) => match receiver.await {
-                        Ok(handler_response) => response_from_handler(handler_response),
-                        Err(_sender_dropped) => plain_response(
+                match dispatch_outcome {
+                    Ok(mut dispatched_request) => match dispatched_request.response().await {
+                        Some(handler_response) => response_from_handler(handler_response),
+                        None => plain_response(
                             StatusCode::INTERNAL_SERVER_ERROR,
                             "Internal Server Error",
                         ),
@@ -422,6 +424,7 @@ fn _core(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(core_version, module)?)?;
     module.add_function(wrap_pyfunction!(start_server, module)?)?;
     module.add_class::<Server>()?;
+    module.add_class::<rayo_dispatch::HandlerTask>()?;
     Ok(())
 }
 
