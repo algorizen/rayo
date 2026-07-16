@@ -16,7 +16,7 @@ use hyper::{Request, Response, StatusCode};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-use rayo_dispatch::{EventLoop, HandlerResponse};
+use rayo_dispatch::{EventLoopPool, HandlerResponse};
 use rayo_server::{BoxedResponseFuture, RequestService, ResponseBody};
 use tokio::sync::{oneshot, watch};
 
@@ -71,7 +71,7 @@ struct RouteEntry {
 struct AppService {
     router: rayo_router::Router,
     routes: Vec<RouteEntry>,
-    event_loop: EventLoop,
+    event_loops: EventLoopPool,
 }
 
 impl AppService {
@@ -173,7 +173,7 @@ impl RequestService for AppService {
             let response_receiver =
                 Python::attach(
                     |py| match self.build_kwargs(py, route, &route_match.path_params) {
-                        Ok(kwargs) => Ok(self.event_loop.schedule(py, &route.handler, kwargs)),
+                        Ok(kwargs) => Ok(self.event_loops.schedule(py, &route.handler, kwargs)),
                         Err(error_response) => Err(error_response),
                     },
                 );
@@ -315,7 +315,7 @@ impl Server {
                 let _ = self.runtime.block_on(receiver);
             });
         }
-        self.service.event_loop.stop(py);
+        self.service.event_loops.stop(py);
     }
 }
 
@@ -323,8 +323,16 @@ type RouteSpec = (String, String, Py<PyAny>, bool, Vec<(String, u8)>);
 
 /// Bind, start serving on a background runtime, and return the handle.
 /// Every failure here is a startup failure: specific and immediate.
+/// `loop_threads` is resolved by the Python surface (cores on free-threaded
+/// builds, 1 on GIL builds) so the policy lives next to its documentation.
 #[pyfunction]
-fn start_server(py: Python<'_>, host: &str, port: u16, routes: Vec<RouteSpec>) -> PyResult<Server> {
+fn start_server(
+    py: Python<'_>,
+    host: &str,
+    port: u16,
+    routes: Vec<RouteSpec>,
+    loop_threads: usize,
+) -> PyResult<Server> {
     let mut router = rayo_router::Router::new();
     let mut route_entries = Vec::with_capacity(routes.len());
     for (route_index, (method, path, handler, is_async, raw_params)) in
@@ -352,11 +360,11 @@ fn start_server(py: Python<'_>, host: &str, port: u16, routes: Vec<RouteSpec>) -
         });
     }
 
-    let event_loop = EventLoop::start(py)?;
+    let event_loops = EventLoopPool::start(py, loop_threads)?;
     let service = Arc::new(AppService {
         router,
         routes: route_entries,
-        event_loop,
+        event_loops,
     });
 
     let runtime = tokio::runtime::Builder::new_multi_thread()

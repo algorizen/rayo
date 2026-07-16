@@ -9,7 +9,9 @@ the file and line of the handler that caused them (invariant 5).
 from __future__ import annotations
 
 import inspect
+import os
 import re
+import sys
 from collections.abc import Callable
 from typing import Any, get_type_hints
 
@@ -58,10 +60,28 @@ class Rayo:
 
         return add_route
 
-    def run(self, *, host: str = "127.0.0.1", port: int = 8000) -> None:
-        """Serve until Ctrl+C, then shut down gracefully."""
-        server = self._start(host=host, port=port)
-        print(f"Rayo serving on http://{host}:{server.port} (Ctrl+C to stop)")
+    def run(
+        self,
+        *,
+        host: str = "127.0.0.1",
+        port: int = 8000,
+        loop_threads: int | None = None,
+    ) -> None:
+        """Serve until Ctrl+C, then shut down gracefully.
+
+        ``loop_threads`` is the number of Python event-loop threads handling
+        requests. Default: one per CPU core on free-threaded builds (they run
+        handlers truly in parallel), one total on GIL builds (where more loops
+        add switching overhead, not parallelism).
+        """
+        resolved_loop_threads = _resolve_loop_threads(loop_threads)
+        server = self._start(host=host, port=port, loop_threads=resolved_loop_threads)
+        topology = (
+            f"{resolved_loop_threads} event-loop thread"
+            f"{'s' if resolved_loop_threads != 1 else ''}"
+            f"{' — free-threaded parallelism' if _is_free_threaded() else ''}"
+        )
+        print(f"Rayo serving on http://{host}:{server.port} ({topology}; Ctrl+C to stop)")
         try:
             server.wait()
         except KeyboardInterrupt:
@@ -69,13 +89,37 @@ class Rayo:
         finally:
             server.shutdown()
 
-    def _start(self, *, host: str = "127.0.0.1", port: int = 0) -> _core.Server:
+    def _start(
+        self,
+        *,
+        host: str = "127.0.0.1",
+        port: int = 0,
+        loop_threads: int | None = None,
+    ) -> _core.Server:
         """Start serving in the background and return the server handle.
 
         Internal for now (tests and tooling); the public embedding API is
         designed in M1 alongside the worker topologies.
         """
-        return _core.start_server(host, port, self._routes)
+        return _core.start_server(host, port, self._routes, _resolve_loop_threads(loop_threads))
+
+
+def _is_free_threaded() -> bool:
+    gil_check = getattr(sys, "_is_gil_enabled", None)
+    return gil_check is not None and not gil_check()
+
+
+def _resolve_loop_threads(loop_threads: int | None) -> int:
+    if loop_threads is not None:
+        if loop_threads < 1:
+            raise ValueError(
+                f"loop_threads must be at least 1, got {loop_threads}. Leave it unset "
+                f"to let Rayo pick: one per core on free-threaded builds, one on GIL builds."
+            )
+        return loop_threads
+    if _is_free_threaded():
+        return os.cpu_count() or 1
+    return 1
 
 
 def _handler_location(handler: Handler) -> str:

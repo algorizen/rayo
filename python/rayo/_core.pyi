@@ -12,4 +12,5 @@ def start_server(
     host: str,
     port: int,
     routes: list[tuple[str, str, Callable[..., Any], bool, list[tuple[str, int]]]],
+    loop_threads: int,
 ) -> Server: ...

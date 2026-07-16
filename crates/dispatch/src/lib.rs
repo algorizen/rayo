@@ -15,6 +15,7 @@
 //! (v1 contains none.)
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 
 use pyo3::prelude::*;
@@ -121,16 +122,29 @@ pub struct EventLoop {
 
 impl EventLoop {
     /// Create an asyncio event loop and run it forever on a dedicated thread.
-    pub fn start(py: Python<'_>) -> PyResult<Self> {
+    pub fn start(py: Python<'_>, thread_name: String) -> PyResult<Self> {
         let asyncio = py.import("asyncio")?;
         let loop_object = asyncio.call_method0("new_event_loop")?;
         let spawn_helper = py.import("rayo._runtime")?.getattr("spawn_handler")?;
 
         let loop_for_thread: Py<PyAny> = loop_object.clone().unbind();
+        let python_visible_name = thread_name.clone();
         let thread = std::thread::Builder::new()
-            .name("rayo-asyncio".to_owned())
+            .name(thread_name)
             .spawn(move || {
                 Python::attach(|thread_py| {
+                    // Foreign threads show up in Python as "Dummy-N"; give
+                    // this one its real name so tracebacks and diagnostics
+                    // point somewhere meaningful.
+                    let renamed = thread_py
+                        .import("threading")
+                        .and_then(|threading| threading.call_method0("current_thread"))
+                        .and_then(|current_thread| {
+                            current_thread.setattr("name", python_visible_name)
+                        });
+                    if let Err(rename_error) = renamed {
+                        rename_error.print(thread_py);
+                    }
                     let event_loop = loop_for_thread.bind(thread_py);
                     if let Err(loop_error) = event_loop.call_method0("run_forever") {
                         loop_error.print(thread_py);
@@ -211,6 +225,58 @@ impl EventLoop {
                     eprintln!("rayo-dispatch: event-loop thread panicked during shutdown");
                 }
             });
+        }
+    }
+}
+
+/// N event loops on N threads, one intended per core on free-threaded builds
+/// (where they run Python truly in parallel) and one total on GIL builds.
+/// Requests distribute round-robin; the pool is `Sync` and lock-free on the
+/// scheduling path (invariant 4).
+pub struct EventLoopPool {
+    loops: Vec<EventLoop>,
+    next_loop_index: AtomicUsize,
+}
+
+impl EventLoopPool {
+    /// Start `size` loop threads. `size == 0` is a startup error — reported
+    /// immediately and specifically (invariant 5), never deferred.
+    pub fn start(py: Python<'_>, size: usize) -> PyResult<Self> {
+        if size == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "loop_threads must be at least 1 (use None to let Rayo pick: \
+                 one per core on free-threaded builds, one total on GIL builds)",
+            ));
+        }
+        let mut loops = Vec::with_capacity(size);
+        for loop_index in 0..size {
+            loops.push(EventLoop::start(py, format!("rayo-loop-{loop_index}"))?);
+        }
+        Ok(Self {
+            loops,
+            next_loop_index: AtomicUsize::new(0),
+        })
+    }
+
+    pub fn size(&self) -> usize {
+        self.loops.len()
+    }
+
+    /// Schedule onto the next loop, round-robin.
+    pub fn schedule(
+        &self,
+        py: Python<'_>,
+        handler: &Py<PyAny>,
+        handler_kwargs: Bound<'_, PyDict>,
+    ) -> oneshot::Receiver<HandlerResponse> {
+        let loop_index = self.next_loop_index.fetch_add(1, Ordering::Relaxed) % self.loops.len();
+        self.loops[loop_index].schedule(py, handler, handler_kwargs)
+    }
+
+    /// Stop every loop and join its thread. Idempotent.
+    pub fn stop(&self, py: Python<'_>) {
+        for event_loop in &self.loops {
+            event_loop.stop(py);
         }
     }
 }
