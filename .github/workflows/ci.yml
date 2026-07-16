@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_DEFAULT: "3.14"
+
+jobs:
+  lint:
+    name: Lint (ruff, mypy, fmt, clippy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ env.PYTHON_DEFAULT }}
+      - name: Sync (builds the extension)
+        run: uv sync --group dev
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run mypy
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  rust-tests:
+    name: Rust tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ env.PYTHON_DEFAULT }}
+      - run: cargo test --workspace
+
+  python-tests:
+    name: Python ${{ matrix.python }} (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        # 3.14t is the free-threaded build — a first-class target (ADR-0002):
+        # the suite must pass on BOTH interpreter builds, not just GIL ones.
+        python: ["3.10", "3.11", "3.12", "3.13", "3.14", "3.14t"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Sync (builds the extension)
+        run: uv sync --group dev
+      - run: uv run pytest
+
+  wheel-dry-run:
+    name: Wheel build dry run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build a manylinux wheel + sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release --out dist --sdist
+          manylinux: auto
+      - name: Install the wheel and import it
+        run: |
+          python3 -m pip install --no-index --find-links dist rayo
+          python3 -c "import rayo; print('rayo', rayo.__version__, 'imports OK')"

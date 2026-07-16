@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions & ideas
+    url: https://github.com/algorizen/rayo/discussions
+    about: Ask questions, share ideas, and discuss designs in Discussions.
+  - name: Security vulnerability
+    url: https://github.com/algorizen/rayo/blob/main/SECURITY.md
+    about: Please report vulnerabilities privately — never in a public issue.

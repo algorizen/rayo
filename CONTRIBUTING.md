@@ -25,13 +25,15 @@ Issues labeled `good-first-issue` are curated to be genuinely finishable in an e
 ```bash
 # prerequisites: uv (https://docs.astral.sh/uv/), Rust toolchain (only for core work)
 git clone https://github.com/algorizen/rayo && cd rayo
-uv sync                    # Python env + dev dependencies
-uv run maturin develop     # build the Rust core into the venv (skip for docs-only work)
+uv sync                    # Python env + dev dependencies + builds the Rust core
 uv run pytest              # Python tests
+uv run maturin develop     # rebuild just the Rust core while iterating on it
 cargo test --workspace     # Rust tests (core work only)
 ```
 
-To test against free-threaded Python: `uv python install 3.14t && uv venv --python 3.14t`.
+To test on free-threaded Python:
+`UV_PROJECT_ENVIRONMENT=.venv-ft uv sync --python 3.14t`, then prefix `uv run`
+commands with the same variable (keeps the GIL-build venv in `.venv` intact).
 
 ## Pull requests
 

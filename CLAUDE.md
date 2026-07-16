@@ -32,7 +32,7 @@ Rayo is a Python web framework with a Rust core, designed free-threaded-first. R
 
 ## Working here
 
-- Build: `uv run maturin develop`. Tests: `uv run pytest` (Python), `cargo test --workspace` (Rust). Free-threaded testing: `uv venv --python 3.14t`.
+- Build: `uv sync` (builds the Rust core too); `uv run maturin develop` to rebuild just the core. Tests: `uv run pytest` (Python), `cargo test --workspace` (Rust). Free-threaded testing: `UV_PROJECT_ENVIRONMENT=.venv-ft uv sync --python 3.14t`, then the same prefix on `uv run` commands.
 - When editing the hot path, state in the PR how the change respects the invariants above.
 - Prior art to consult before inventing: Granian (scheduler, worker topology — MIT), pydantic-core (schema IR handoff), msgspec (slotted decode). ADRs cite the specific lessons.
 - Do not add runtime Python dependencies (allowlist in code standards is empty) or new benchmark headline claims without the harness.

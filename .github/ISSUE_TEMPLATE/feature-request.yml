@@ -1,0 +1,28 @@
+name: Feature request
+description: Propose an improvement. Public-API changes go through an RFC first.
+labels: ["enhancement", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Changes to the public API follow the [RFC process](https://github.com/algorizen/rayo/blob/main/docs/rfcs/README.md).
+        For open-ended ideas, start a [Discussion](https://github.com/algorizen/rayo/discussions) instead.
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What can't you do today, or what is harder than it should be?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What would you like Rayo to do? Sketch the API if you can.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Workarounds you use today, or other designs you rejected.

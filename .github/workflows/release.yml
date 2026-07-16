@@ -1,0 +1,92 @@
+# Release automation (ADR-0008): tag → wheels → PyPI, scripted end-to-end so
+# any `infra` maintainer can cut a release. PyPI is never behind the repo.
+#
+# To release: bump the version in pyproject.toml AND Cargo.toml (workspace),
+# commit, tag `vX.Y.Z`, push the tag. Publishing uses PyPI Trusted Publishing
+# (OIDC) — configure the `pypi` environment on GitHub and the publisher on
+# PyPI; no API token secrets.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  linux-wheels:
+    name: Linux wheels (${{ matrix.target }}, ${{ matrix.libc }})
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64, aarch64]
+        libc: [manylinux, musllinux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.libc == 'musllinux' && 'musllinux_1_2' || 'auto' }}
+          command: build
+          # Per-version wheels, cp310–cp314 + the free-threaded cp314t (ADR-0008).
+          args: --release --out dist --interpreter 3.10 3.11 3.12 3.13 3.14 3.14t
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-linux-${{ matrix.target }}-${{ matrix.libc }}
+          path: dist
+
+  macos-windows-wheels:
+    name: ${{ matrix.platform.name }} wheels (cp${{ matrix.python }})
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - { name: macOS, os: macos-latest, target: universal2-apple-darwin }
+          - { name: Windows, os: windows-latest, target: x64 }
+        python: ["3.10", "3.11", "3.12", "3.13", "3.14", "3.14t"]
+    runs-on: ${{ matrix.platform.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.platform.target }}
+          command: build
+          args: --release --out dist --interpreter python${{ matrix.python }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.platform.name }}-${{ matrix.python }}
+          path: dist
+
+  sdist:
+    name: sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist
+
+  publish:
+    name: Publish to PyPI
+    needs: [linux-wheels, macos-windows-wheels, sdist]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write # PyPI Trusted Publishing (OIDC)
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist

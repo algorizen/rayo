@@ -1,0 +1,41 @@
+name: Bug report
+description: Something is broken or behaves differently than documented.
+labels: ["bug", "triage"]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: The smallest app/snippet that shows the problem.
+      render: python
+    validations:
+      required: true
+  - type: input
+    id: rayo-version
+    attributes:
+      label: Rayo version
+      placeholder: "python -c \"import rayo; print(rayo.__version__)\""
+    validations:
+      required: true
+  - type: input
+    id: python-build
+    attributes:
+      label: Python version and build
+      description: Include whether it is a free-threaded (t) build.
+      placeholder: "e.g. 3.14.6 (free-threaded) — python -VV"
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: OS / platform
+      placeholder: "e.g. Ubuntu 24.04 x86_64, macOS 15 arm64"
+    validations:
+      required: true

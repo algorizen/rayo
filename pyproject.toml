@@ -1,0 +1,81 @@
+[build-system]
+requires = ["maturin>=1.14,<2"]
+build-backend = "maturin"
+
+[project]
+name = "rayo"
+version = "0.0.1"
+description = "The web framework for free-threaded Python — Rust core, Python surface."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Algorizen and the Rayo contributors" }]
+keywords = ["web", "framework", "async", "free-threading", "rust", "http"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Rust",
+    "Topic :: Internet :: WWW/HTTP",
+    "Typing :: Typed",
+]
+# Zero runtime Python dependencies by policy (docs/code-standards.md).
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/algorizen/rayo"
+Repository = "https://github.com/algorizen/rayo"
+Roadmap = "https://github.com/algorizen/rayo/blob/main/ROADMAP.md"
+
+[tool.maturin]
+python-source = "python"
+module-name = "rayo._core"
+manifest-path = "crates/core/Cargo.toml"
+features = ["pyo3/extension-module"]
+
+[dependency-groups]
+dev = [
+    "maturin>=1.14,<2",
+    "pytest>=8",
+    "mypy>=1.14",
+    "ruff>=0.9",
+]
+
+[tool.uv]
+# uv caches the built wheel; rebuild whenever the Rust core or config changes.
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "Cargo.toml" },
+    { file = "crates/**/Cargo.toml" },
+    { file = "crates/**/*.rs" },
+    { file = "python/**/*.py" },
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle
+    "F",   # pyflakes
+    "I",   # import sorting
+    "UP",  # modern syntax upgrades
+    "B",   # bugbear
+    "SIM", # simplifications
+    "RUF", # ruff-specific
+]
+
+[tool.mypy]
+strict = true
+files = ["python/rayo", "tests"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

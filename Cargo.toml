@@ -1,0 +1,39 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/core",
+    "crates/server",
+    "crates/router",
+    "crates/schema",
+    "crates/dispatch",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/algorizen/rayo"
+authors = ["Algorizen and the Rayo contributors"]
+
+[workspace.dependencies]
+# extension-module is NOT enabled here so `cargo test --workspace` links against
+# a real interpreter; maturin adds it when building wheels (see pyproject.toml).
+pyo3 = { version = "0.29" }
+rayo-server = { path = "crates/server" }
+rayo-router = { path = "crates/router" }
+rayo-schema = { path = "crates/schema" }
+rayo-dispatch = { path = "crates/dispatch" }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+# Code standards: no `.unwrap()` reachable from request handling. The lint is
+# workspace-wide; tests may `#[allow]` locally where a panic is the assertion.
+unwrap_used = "warn"
+expect_used = "warn"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
