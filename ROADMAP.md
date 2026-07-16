@@ -9,7 +9,7 @@ Public, honest, and updated as reality changes. Dates are targets, not promises.
 - [x] Research: ecosystem history, framework pain-point evidence, free-threading readiness, boundary engineering
 - [x] Product plan, architecture, decision records
 - [ ] Reserve `rayo` (+ `rayoweb` defensively) on PyPI; create `github.com/algorizen/rayo`; set up docs subdomain on algorizen.ai
-- [ ] Cargo workspace + maturin skeleton; CI matrix (Linux/mac/Windows × cp310–cp314 + cp314t)
+- [x] Cargo workspace + maturin skeleton; CI matrix (Linux/mac/Windows × cp310–cp314 + cp314t)
 - [ ] `rayo-server`: Tokio/Hyper embedded server, HTTP/1.1 + HTTP/2
 - [ ] `rayo-router`: radix routing, standalone decorators
 - [ ] `rayo-dispatch`: coroutine scheduler (Granian-style), single-attach boundary

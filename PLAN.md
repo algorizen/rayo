@@ -24,10 +24,10 @@ Dependency spine: W1 dispatch + W2 models are the critical path; W3 builds on bo
 ## Milestone 0 — Repo bootstrap (target: +2 weeks)
 
 - [ ] Reserve `rayo` + `rayoweb` on PyPI (placeholder 0.0.1); create `github.com/algorizen/rayo`; docs subdomain on algorizen.ai
-- [ ] Cargo workspace: `crates/{core,server,router,schema,dispatch}` stubs; `python/rayo/` package; maturin config; `uv` workflow
-- [ ] CI: lint (ruff/mypy/fmt/clippy), test on {Linux, macOS, Windows} × {3.10–3.14, 3.14t}; wheel-build dry run
-- [ ] Release automation scripted end-to-end (tag → wheels → PyPI); one real 0.0.x release proves it
-- [ ] Repo docs land (this repo's .md set); Discussions + issue templates on
+- [x] Cargo workspace: `crates/{core,server,router,schema,dispatch}` stubs; `python/rayo/` package; maturin config; `uv` workflow
+- [x] CI: lint (ruff/mypy/fmt/clippy), test on {Linux, macOS, Windows} × {3.10–3.14, 3.14t}; wheel-build dry run
+- [ ] Release automation scripted end-to-end (tag → wheels → PyPI); one real 0.0.x release proves it *(workflow written; needs PyPI trusted publisher + first tag)*
+- [x] Repo docs land (this repo's .md set); Discussions + issue templates on
 
 **Exit:** `pip install <name>` works; `from <name> import <App>` imports; CI green on both interpreter builds.
 
