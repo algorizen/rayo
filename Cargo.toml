@@ -20,6 +20,12 @@ authors = ["Algorizen and the Rayo contributors"]
 # extension-module is NOT enabled here so `cargo test --workspace` links against
 # a real interpreter; maturin adds it when building wheels (see pyproject.toml).
 pyo3 = { version = "0.29" }
+tokio = { version = "1.52", features = ["rt-multi-thread", "net", "sync", "signal", "time", "macros"] }
+hyper = { version = "1.10", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto", "server-graceful"] }
+http-body-util = "0.1"
+bytes = "1"
+matchit = "0.9"
 rayo-server = { path = "crates/server" }
 rayo-router = { path = "crates/router" }
 rayo-schema = { path = "crates/schema" }

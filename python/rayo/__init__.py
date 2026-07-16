@@ -23,17 +23,6 @@ if _installed_package_version != _compiled_core_version:
 
 __version__ = _compiled_core_version
 
-
-class Rayo:
-    """The Rayo application object.
-
-    Milestone 0 placeholder: routing, dependency injection, and the embedded
-    server land in Milestone 1 (see PLAN.md). It exists now so that
-    ``from rayo import Rayo`` is real from the first published release.
-    """
-
-    def __init__(self, *, title: str = "Rayo app") -> None:
-        self.title = title
-
+from rayo._app import Rayo  # noqa: E402 — the version consistency check must run first
 
 __all__ = ["Rayo", "__version__"]

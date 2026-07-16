@@ -14,7 +14,15 @@ name = "_core"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+bytes = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
 pyo3 = { workspace = true }
+rayo-dispatch = { workspace = true }
+rayo-router = { workspace = true }
+rayo-schema = { workspace = true }
+rayo-server = { workspace = true }
+tokio = { workspace = true }
 
 [lints]
 workspace = true

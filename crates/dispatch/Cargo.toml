@@ -9,6 +9,9 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+pyo3 = { workspace = true }
+rayo-schema = { workspace = true }
+tokio = { workspace = true }
 
 [lints]
 workspace = true

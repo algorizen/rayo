@@ -9,6 +9,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+matchit = { workspace = true }
 
 [lints]
 workspace = true
