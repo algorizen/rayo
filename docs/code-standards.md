@@ -39,5 +39,7 @@ Enforced by CI (`ruff`, `mypy --strict`, `cargo fmt --check`, `cargo clippy -D w
 ## Commit messages
 
 - Conventional-commit style: `type(scope): summary` (`feat`, `fix`, `perf`, `docs`, `refactor`, `test`, `ci`, `chore`).
+- PR titles and issue titles follow the same `type(scope): summary` convention.
 - Describe the code change itself — never the plan, discussion, or review process around it, and no validation status ("tests pass") in the message.
 - No AI/tool attribution trailers.
+- History rewriting: free before a PR exists; after that, follow-up commits are preferred and force-pushes (`--force-with-lease` only) are reserved for rewrites that genuinely improve the record. `main` is never rewritten.

@@ -45,9 +45,13 @@ commands with the same variable (keeps the GIL-build venv in `.venv` intact).
 
 We commit to first review feedback within **7 days**. Stale-PR purgatory is a documented failure mode of this ecosystem; if we're slow, ping the thread — that's not rude, it's helping.
 
-## Commit messages
+## Commits, titles, and history
 
 Conventional-commit style: `type(scope): summary` — e.g. `feat(router): add path parameter constraints`, `fix(schema): reject NaN in float fields`. Describe the code change itself, not the process around it.
+
+**PR and issue titles use the same `type(scope): summary` format** (`feat`, `fix`, `perf`, `docs`, `refactor`, `test`, `ci`, `chore`), so the tracker reads like the log it becomes.
+
+**Rewriting history:** amend and rebase freely on branches that have no open PR. Once a PR is open, prefer follow-up commits so review history stays inspectable; amend and force-push only when rewriting genuinely improves the record (for example, correcting a just-pushed commit nobody has built on) — always with `--force-with-lease`, and never on `main`.
 
 ## RFCs
 
