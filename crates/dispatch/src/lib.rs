@@ -6,29 +6,52 @@
 //! `asyncio.Task` is created per request. Yielded futures get the task as a
 //! done callback; bare yields take one trip through the loop via `call_soon`;
 //! cross-thread entry (initial dispatch, disconnect cancellation) is the only
-//! use of `call_soon_threadsafe`. Every step runs inside a per-request
-//! `contextvars.Context` and between `_enter_task`/`_leave_task`, so
-//! `asyncio.current_task()`, `asyncio.timeout`, and `TaskGroup` behave as
-//! they would under `asyncio.Task`. The design is ported from Granian's
+//! use of `call_soon_threadsafe`. The design is ported from Granian's
 //! MIT-licensed scheduler (credited in ADR-0004).
+//!
+//! Because no `asyncio.Task` exists, everything Task provides is reproduced
+//! deliberately:
+//!
+//! - every step runs inside a per-request `contextvars.Context` and between
+//!   `_enter_task`/`_leave_task`, and tasks register with `_register_task`,
+//!   so `asyncio.current_task()`, `asyncio.all_tasks()`, `asyncio.timeout`,
+//!   and `TaskGroup` behave as under `asyncio.Task`;
+//! - the coroutine and context are built lazily on the loop thread (first
+//!   step), so decorator wrappers that touch the running loop before
+//!   returning the coroutine keep working;
+//! - each loop keeps a registry of its live tasks: shutdown cancels them (so
+//!   `finally` cleanup runs) and anything left when the loop dies is closed
+//!   and disposed rather than leaked;
+//! - `HandlerTask` implements `__traverse__` so the task ↔ future reference
+//!   cycle a parked request forms stays visible to CPython's cycle GC.
 //!
 //! Boundary invariants: the request path enters Python exactly once, and
 //! responses are serialized to bytes in Rust while reading (never creating)
 //! Python objects.
 //!
+//! Known limitations, accepted deliberately: a task disposed after its loop
+//! died gets synchronous cleanup only (`coroutine.close()` — awaiting
+//! cleanup cannot run without a loop, and the failure is logged), and
+//! [`DispatchedRequest`]'s drop-cancellation must attach to Python, which is
+//! unsafe during interpreter finalization — mitigated by the finished-task
+//! fast path (after `stop()` every task is finished, so teardown drops never
+//! attach), not eliminated.
+//!
 //! Per code standards, this crate is where the project's `unsafe` FFI code is
 //! confined; every `unsafe` block carries a `// SAFETY:` comment.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 
-use pyo3::exceptions::asyncio::CancelledError;
+use pyo3::exceptions::asyncio::{CancelledError, InvalidStateError};
 use pyo3::exceptions::{PyRuntimeError, PyStopIteration};
 use pyo3::ffi;
 use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyString};
+use pyo3::{PyTraverseError, PyVisit};
 use tokio::sync::oneshot;
 
 /// A handler's outcome, already reduced to wire data — nothing Python-shaped
@@ -93,9 +116,8 @@ fn report_handler_error(py: Python<'_>, error: PyErr) -> HandlerResponse {
 
 /// The Rust half of a request's completion: the oneshot back to the server
 /// task plus the owning loop's in-flight gauge. `send` fires at most once;
-/// if the channel is dropped without ever sending (the loop shut down, an
-/// allocation failed), `Drop` still balances the gauge and the dropped
-/// sender surfaces as a 500 on the receiver side.
+/// if the channel is dropped without ever sending, `Drop` still balances the
+/// gauge and the dropped sender surfaces as a 500 on the receiver side.
 struct ResponseChannel {
     response_sender: Mutex<Option<oneshot::Sender<HandlerResponse>>>,
     in_flight: Arc<AtomicUsize>,
@@ -132,14 +154,47 @@ impl Drop for ResponseChannel {
     }
 }
 
+/// Handles shared by every task on one event loop, plus the loop's registry
+/// of live tasks. The registry is what makes shutdown honest: it is the
+/// cancellation list for graceful drain, and it keeps abandoned tasks
+/// reachable until [`EventLoop::stop`] disposes of them.
+///
+/// Deliberately *not* visited from `HandlerTask::__traverse__`: these `Py`
+/// references are single edges owned by this shared struct, and reporting
+/// them from every task would over-count them to the cycle GC.
+struct LoopHandles {
+    loop_object: Py<PyAny>,
+    enter_task: Py<PyAny>,
+    leave_task: Py<PyAny>,
+    register_task: Py<PyAny>,
+    unregister_task: Py<PyAny>,
+    live_tasks: Mutex<HashMap<usize, Py<HandlerTask>>>,
+}
+
+impl LoopHandles {
+    fn lock_live_tasks(&self) -> MutexGuard<'_, HashMap<usize, Py<HandlerTask>>> {
+        self.live_tasks
+            .lock()
+            .unwrap_or_else(|poisoned_lock| poisoned_lock.into_inner())
+    }
+}
+
 /// Mutable half of a [`HandlerTask`]. Every transition happens on the task's
 /// loop thread (steps and wakes run as loop callbacks; cross-thread
 /// cancellation arrives via `call_soon_threadsafe`), so the mutex is for
 /// `Sync` soundness, not contention.
 #[derive(Default)]
-struct HandlerTaskState {
+struct TaskState {
+    /// Built on the loop thread at the first step; `None` until then.
+    coroutine: Option<Py<PyAny>>,
+    /// Per-request `contextvars.Context`; every step runs inside it — the
+    /// same semantics `asyncio.Task` provides.
+    context: Option<Py<PyAny>>,
     /// The future the coroutine is currently suspended on, if any.
     waiting_on: Option<Py<PyAny>>,
+    /// A protocol error to deliver on the next step (scheduled via
+    /// `call_soon` so a misbehaving coroutine cannot starve the loop).
+    deferred_throw: Option<Py<PyAny>>,
     /// A cancellation could not be absorbed by a pending future; deliver
     /// `CancelledError` at the next step instead of sending.
     must_cancel: bool,
@@ -147,8 +202,14 @@ struct HandlerTaskState {
     /// Task-protocol `cancelling()` counter (`asyncio.timeout` and
     /// `TaskGroup` rely on cancel/uncancel bookkeeping).
     cancel_requests: u32,
+    registered_with_asyncio: bool,
+    name: Option<Py<PyAny>>,
+    done_callbacks: Vec<(Py<PyAny>, Py<PyAny>)>,
     finished: bool,
     finished_cancelled: bool,
+    cancelled_message: Option<Py<PyAny>>,
+    stored_result: Option<Py<PyAny>>,
+    stored_exception: Option<Py<PyAny>>,
 }
 
 /// What one advance of the coroutine produced.
@@ -165,6 +226,15 @@ enum ParkOutcome<'py> {
     /// the coroutine so the handler sees a specific error.
     BadYield(Bound<'py, PyAny>),
     Failed,
+}
+
+/// How the request ended, for the Future-protocol accessors.
+enum CompletionKind {
+    Returned(Py<PyAny>),
+    Raised(Py<PyAny>),
+    Cancelled(Option<Py<PyAny>>),
+    /// Internal scheduler failure: no handler outcome exists.
+    Aborted,
 }
 
 fn runtime_error_instance(py: Python<'_>, message: String) -> Bound<'_, PyAny> {
@@ -184,47 +254,204 @@ fn cancelled_error_instance<'py>(py: Python<'py>, message: Option<Py<PyAny>>) ->
 
 /// One request's task-like: steps the handler coroutine to completion and
 /// sends the response over the oneshot. Frozen: shared across threads
-/// without the GIL. Freelisted: allocated and dropped once per request.
-#[pyclass(frozen, freelist = 128, name = "HandlerTask", module = "rayo._core")]
+/// without the GIL. Weakref support is required by asyncio's task registry.
+#[pyclass(
+    frozen,
+    weakref,
+    freelist = 128,
+    name = "HandlerTask",
+    module = "rayo._core"
+)]
 pub struct HandlerTask {
-    coroutine: Py<PyAny>,
-    /// Per-request `contextvars.Context`, copied at dispatch. Every step runs
-    /// inside it — the same semantics `asyncio.Task` provides.
-    context: Py<PyAny>,
-    event_loop: Py<PyAny>,
-    enter_task: Py<PyAny>,
-    leave_task: Py<PyAny>,
+    handler: Py<PyAny>,
+    handler_kwargs: Py<PyDict>,
+    loop_handles: Arc<LoopHandles>,
     channel: ResponseChannel,
-    state: Mutex<HandlerTaskState>,
+    state: Mutex<TaskState>,
 }
 
 impl HandlerTask {
-    fn lock_state(&self) -> MutexGuard<'_, HandlerTaskState> {
+    fn lock_state(&self) -> MutexGuard<'_, TaskState> {
         self.state
             .lock()
             .unwrap_or_else(|poisoned_lock| poisoned_lock.into_inner())
     }
 
-    fn finish(&self, response: HandlerResponse, cancelled: bool) {
-        {
+    /// Terminal bookkeeping, exactly once: record the outcome for the
+    /// Future-protocol accessors, leave the registries, fire done callbacks,
+    /// and release the response last so a woken client can never observe a
+    /// half-finished task.
+    fn finish(
+        &self,
+        py: Python<'_>,
+        task_object: &Bound<'_, Self>,
+        response: HandlerResponse,
+        completion: CompletionKind,
+    ) {
+        let (was_registered, done_callbacks) = {
             let mut state = self.lock_state();
+            if state.finished {
+                self.channel.send(response); // no-op unless never sent
+                return;
+            }
             state.finished = true;
-            state.finished_cancelled = cancelled;
             state.waiting_on = None;
+            state.deferred_throw = None;
+            match completion {
+                CompletionKind::Returned(return_value) => {
+                    state.stored_result = Some(return_value);
+                }
+                CompletionKind::Raised(exception) => state.stored_exception = Some(exception),
+                CompletionKind::Cancelled(message) => {
+                    state.finished_cancelled = true;
+                    state.cancelled_message = message;
+                }
+                CompletionKind::Aborted => {}
+            }
+            (
+                std::mem::take(&mut state.registered_with_asyncio),
+                std::mem::take(&mut state.done_callbacks),
+            )
+        };
+        self.loop_handles
+            .lock_live_tasks()
+            .remove(&(task_object.as_ptr() as usize));
+        if was_registered {
+            if let Err(unregister_error) = self
+                .loop_handles
+                .unregister_task
+                .bind(py)
+                .call1((task_object,))
+            {
+                unregister_error.print(py);
+            }
+        }
+        for (callback, callback_context) in done_callbacks {
+            let kwargs = PyDict::new(py);
+            let fired = kwargs
+                .set_item(intern!(py, "context"), callback_context)
+                .and_then(|()| {
+                    self.loop_handles
+                        .loop_object
+                        .bind(py)
+                        .call_method(
+                            intern!(py, "call_soon"),
+                            (callback, task_object),
+                            Some(&kwargs),
+                        )
+                        .map(|_callback_handle| ())
+                });
+            if let Err(callback_error) = fired {
+                callback_error.print(py);
+            }
         }
         self.channel.send(response);
+    }
+
+    /// Close the coroutine so its `finally`/`__aexit__` cleanup runs, on the
+    /// paths where it can never be stepped again. Cleanup that awaits cannot
+    /// complete here; the failure is logged rather than silently skipped.
+    fn close_coroutine_quietly(&self, py: Python<'_>) {
+        let coroutine = {
+            let state = self.lock_state();
+            state
+                .coroutine
+                .as_ref()
+                .map(|coroutine| coroutine.clone_ref(py))
+        };
+        if let Some(coroutine) = coroutine {
+            if let Err(close_error) = coroutine.bind(py).call_method0(intern!(py, "close")) {
+                close_error.print(py);
+            }
+        }
+    }
+
+    /// Terminal disposal for a task whose loop is gone: run what cleanup can
+    /// still run, then finish as an internal error.
+    fn dispose(&self, py: Python<'_>, task_object: &Bound<'_, Self>) {
+        self.close_coroutine_quietly(py);
+        self.finish(
+            py,
+            task_object,
+            HandlerResponse::internal_error(),
+            CompletionKind::Aborted,
+        );
+    }
+
+    /// First step only: build the coroutine and per-request context on the
+    /// loop thread, so decorator wrappers that run code before returning the
+    /// coroutine (e.g. touching `asyncio.get_running_loop()`) see the same
+    /// environment they would under asyncio. Returns `false` if the request
+    /// was finished here due to a startup failure.
+    fn start(&self, py: Python<'_>, task_object: &Bound<'_, Self>) -> bool {
+        let coroutine = match self
+            .handler
+            .bind(py)
+            .call((), Some(self.handler_kwargs.bind(py)))
+        {
+            Ok(coroutine) => coroutine,
+            Err(factory_error) => {
+                // Either the registered signature no longer matches (a Rayo
+                // bug) or a decorator wrapper failed before returning the
+                // coroutine (a handler bug); the traceback identifies which.
+                let exception_value = factory_error.value(py).clone().into_any().unbind();
+                let response = report_handler_error(py, factory_error);
+                self.finish(
+                    py,
+                    task_object,
+                    response,
+                    CompletionKind::Raised(exception_value),
+                );
+                return false;
+            }
+        };
+        // SAFETY: PyContext_CopyCurrent returns a new strong reference (or
+        // null with an exception set); the thread is attached (`py`).
+        let context_pointer = unsafe { ffi::PyContext_CopyCurrent() };
+        if context_pointer.is_null() {
+            PyErr::fetch(py).print(py);
+            if let Err(close_error) = coroutine.call_method0(intern!(py, "close")) {
+                close_error.print(py);
+            }
+            self.finish(
+                py,
+                task_object,
+                HandlerResponse::internal_error(),
+                CompletionKind::Aborted,
+            );
+            return false;
+        }
+        // SAFETY: the non-null return is a valid new strong reference.
+        let context = unsafe { Bound::from_owned_ptr(py, context_pointer) };
+        {
+            let mut state = self.lock_state();
+            state.coroutine = Some(coroutine.unbind());
+            state.context = Some(context.unbind());
+        }
+        // Visibility in asyncio.all_tasks(); degraded introspection is not
+        // worth failing the request over.
+        match self
+            .loop_handles
+            .register_task
+            .bind(py)
+            .call1((task_object,))
+        {
+            Ok(_registered) => self.lock_state().registered_with_asyncio = true,
+            Err(register_error) => register_error.print(py),
+        }
+        true
     }
 
     /// Advance the coroutine by sending `None`. `PyIter_Send` returns the
     /// coroutine's return value directly — no `StopIteration` is
     /// materialized on the happy path.
-    fn send_step<'py>(&self, py: Python<'py>) -> StepOutcome<'py> {
+    fn send_step<'py>(&self, py: Python<'py>, coroutine: &Py<PyAny>) -> StepOutcome<'py> {
         let mut step_result: *mut ffi::PyObject = std::ptr::null_mut();
         // SAFETY: `coroutine` is a valid coroutine object kept alive by this
         // task, `Py_None()` is immortal, `step_result` is a valid out
         // pointer, and `py` witnesses that this thread is attached.
         let send_status =
-            unsafe { ffi::PyIter_Send(self.coroutine.as_ptr(), ffi::Py_None(), &mut step_result) };
+            unsafe { ffi::PyIter_Send(coroutine.as_ptr(), ffi::Py_None(), &mut step_result) };
         match send_status {
             ffi::PySendResult::PYGEN_RETURN => {
                 // SAFETY: PYGEN_RETURN hands us a new strong reference to the
@@ -241,9 +468,13 @@ impl HandlerTask {
     }
 
     /// Advance the coroutine by throwing `exception` into it.
-    fn throw_step<'py>(&self, py: Python<'py>, exception: Bound<'py, PyAny>) -> StepOutcome<'py> {
-        match self
-            .coroutine
+    fn throw_step<'py>(
+        &self,
+        py: Python<'py>,
+        coroutine: &Py<PyAny>,
+        exception: Bound<'py, PyAny>,
+    ) -> StepOutcome<'py> {
+        match coroutine
             .bind(py)
             .call_method1(intern!(py, "throw"), (exception,))
         {
@@ -295,6 +526,23 @@ impl HandlerTask {
                 ),
             ));
         }
+        // Cross-loop awaits are an error, exactly as under asyncio.Task:
+        // Rayo runs one loop per core, and a loop-bound object awaited from
+        // another loop's request would wake on the wrong thread — or never.
+        if let Ok(future_loop) = yielded.call_method0(intern!(py, "get_loop")) {
+            if future_loop.as_ptr() != self.loop_handles.loop_object.as_ptr() {
+                return ParkOutcome::BadYield(runtime_error_instance(
+                    py,
+                    String::from(
+                        "handler awaited a future attached to a different event loop; \
+                         Rayo runs one event loop per core, so loop-bound objects \
+                         (futures, locks, queues) created on one loop cannot be awaited \
+                         from a request running on another — create them inside the \
+                         handler, or pin them to a single loop",
+                    ),
+                ));
+            }
+        }
         if let Err(flag_error) = yielded.setattr(blocking_attribute, false) {
             flag_error.print(py);
             return ParkOutcome::Failed;
@@ -313,62 +561,143 @@ impl HandlerTask {
         ParkOutcome::Parked
     }
 
-    /// Step repeatedly until the coroutine parks on a future, reschedules,
-    /// or finishes. Runs inside the entered context and task registration.
-    fn step_until_suspended<'py>(
+    /// Advance the coroutine once and dispose of the outcome: finish on
+    /// return/raise, park on a yielded future, or reschedule through the
+    /// loop (bare yields and protocol errors both defer via `call_soon`, as
+    /// Task does, so a misbehaving coroutine cannot starve the loop thread).
+    /// Runs inside the entered context and task registration.
+    fn step_once<'py>(
         &self,
         py: Python<'py>,
         task_object: &Bound<'_, Self>,
-        mut pending_throw: Option<Bound<'py, PyAny>>,
+        coroutine: &Py<PyAny>,
+        pending_throw: Option<Bound<'py, PyAny>>,
     ) {
-        loop {
-            let outcome = match pending_throw.take() {
-                Some(exception) => self.throw_step(py, exception),
-                None => self.send_step(py),
-            };
-            match outcome {
-                StepOutcome::Returned(return_value) => {
-                    self.finish(response_from_return_value(&return_value), false);
+        let outcome = match pending_throw {
+            Some(exception) => self.throw_step(py, coroutine, exception),
+            None => self.send_step(py, coroutine),
+        };
+        match outcome {
+            StepOutcome::Returned(return_value) => {
+                let response = response_from_return_value(&return_value);
+                self.finish(
+                    py,
+                    task_object,
+                    response,
+                    CompletionKind::Returned(return_value.unbind()),
+                );
+            }
+            StepOutcome::Raised(handler_error) => {
+                if handler_error.is_instance_of::<CancelledError>(py) {
+                    // A cancelled request ends quietly: the client is gone,
+                    // or a timeout already surfaced the outcome to the
+                    // handler. Matches asyncio's no-log policy for cancelled
+                    // tasks.
+                    let cancellation_message = handler_error
+                        .value(py)
+                        .getattr(intern!(py, "args"))
+                        .ok()
+                        .and_then(|arguments| arguments.get_item(0).ok())
+                        .map(Bound::unbind);
+                    self.finish(
+                        py,
+                        task_object,
+                        HandlerResponse::internal_error(),
+                        CompletionKind::Cancelled(cancellation_message),
+                    );
+                } else {
+                    let exception_value = handler_error.value(py).clone().into_any().unbind();
+                    let response = report_handler_error(py, handler_error);
+                    self.finish(
+                        py,
+                        task_object,
+                        response,
+                        CompletionKind::Raised(exception_value),
+                    );
+                }
+            }
+            StepOutcome::Yielded(yielded) => {
+                if yielded.is_none() {
+                    // Bare `yield` (asyncio.sleep(0)): take one trip through
+                    // the loop, then resume.
+                    self.reschedule_or_abort(py, task_object);
                     return;
                 }
-                StepOutcome::Raised(handler_error) => {
-                    if handler_error.is_instance_of::<CancelledError>(py) {
-                        // A cancelled request ends quietly: the client is
-                        // gone, or a timeout already surfaced the outcome to
-                        // the handler. Matches asyncio's no-log policy for
-                        // cancelled tasks.
-                        self.finish(HandlerResponse::internal_error(), true);
-                    } else {
-                        self.finish(report_handler_error(py, handler_error), false);
+                match self.park_on_future(py, task_object, &yielded) {
+                    ParkOutcome::Parked => self.apply_cancel_requested_mid_step(py),
+                    ParkOutcome::BadYield(protocol_error) => {
+                        self.lock_state().deferred_throw = Some(protocol_error.unbind());
+                        self.reschedule_or_abort(py, task_object);
                     }
-                    return;
-                }
-                StepOutcome::Yielded(yielded) => {
-                    if yielded.is_none() {
-                        // Bare `yield` (asyncio.sleep(0)): take one trip
-                        // through the loop, then resume.
-                        if let Err(reschedule_error) = self
-                            .event_loop
-                            .bind(py)
-                            .call_method1(intern!(py, "call_soon"), (task_object,))
-                        {
-                            reschedule_error.print(py);
-                            self.finish(HandlerResponse::internal_error(), false);
-                        }
-                        return;
-                    }
-                    match self.park_on_future(py, task_object, &yielded) {
-                        ParkOutcome::Parked => return,
-                        ParkOutcome::BadYield(protocol_error) => {
-                            pending_throw = Some(protocol_error);
-                        }
-                        ParkOutcome::Failed => {
-                            self.finish(HandlerResponse::internal_error(), false);
-                            return;
-                        }
+                    ParkOutcome::Failed => {
+                        self.close_coroutine_quietly(py);
+                        self.finish(
+                            py,
+                            task_object,
+                            HandlerResponse::internal_error(),
+                            CompletionKind::Aborted,
+                        );
                     }
                 }
             }
+        }
+    }
+
+    /// Queue the next turn via `call_soon`; if even that fails the loop is
+    /// unusable, so run what cleanup can run and resolve the request.
+    fn reschedule_or_abort(&self, py: Python<'_>, task_object: &Bound<'_, Self>) {
+        if let Err(reschedule_error) = self
+            .loop_handles
+            .loop_object
+            .bind(py)
+            .call_method1(intern!(py, "call_soon"), (task_object,))
+        {
+            reschedule_error.print(py);
+            self.close_coroutine_quietly(py);
+            self.finish(
+                py,
+                task_object,
+                HandlerResponse::internal_error(),
+                CompletionKind::Aborted,
+            );
+        }
+    }
+
+    /// Task.__step parity: a `cancel()` that lands while the coroutine is
+    /// mid-step finds no parked future to absorb it and sets `must_cancel`;
+    /// re-apply it against the future the step just parked on.
+    fn apply_cancel_requested_mid_step(&self, py: Python<'_>) {
+        let pending_cancel = {
+            let state = self.lock_state();
+            if state.must_cancel {
+                state.waiting_on.as_ref().map(|future| {
+                    (
+                        future.clone_ref(py),
+                        state
+                            .cancel_message
+                            .as_ref()
+                            .map(|message| message.clone_ref(py)),
+                    )
+                })
+            } else {
+                None
+            }
+        };
+        let Some((parked_future, cancel_message)) = pending_cancel else {
+            return;
+        };
+        match parked_future
+            .bind(py)
+            .call_method1(intern!(py, "cancel"), (cancel_message,))
+        {
+            Ok(cancel_result) => {
+                if cancel_result.is_truthy().unwrap_or(false) {
+                    // The future delivers the CancelledError through the
+                    // normal wake path; the deferred flag is spent.
+                    self.lock_state().must_cancel = false;
+                }
+            }
+            Err(cancel_error) => cancel_error.print(py),
         }
     }
 }
@@ -376,8 +705,8 @@ impl HandlerTask {
 #[pymethods]
 impl HandlerTask {
     /// One scheduler turn. Invoked with no argument by `call_soon` /
-    /// `call_soon_threadsafe` (initial dispatch, bare-yield resume) and with
-    /// the finished future when running as a done callback.
+    /// `call_soon_threadsafe` (initial dispatch, bare-yield resume, deferred
+    /// throws) and with the finished future when running as a done callback.
     #[pyo3(signature = (finished_future = None))]
     fn __call__(task_object: &Bound<'_, Self>, finished_future: Option<&Bound<'_, PyAny>>) {
         let py = task_object.py();
@@ -385,6 +714,8 @@ impl HandlerTask {
 
         let must_cancel;
         let cancel_message;
+        let deferred_throw;
+        let needs_start;
         {
             let mut state = task.lock_state();
             if state.finished {
@@ -394,10 +725,31 @@ impl HandlerTask {
             must_cancel = state.must_cancel;
             state.must_cancel = false;
             cancel_message = state.cancel_message.take();
+            deferred_throw = state.deferred_throw.take();
+            needs_start = state.coroutine.is_none();
         }
 
-        // A wake from a finished future may carry an exception to deliver.
-        let mut pending_throw: Option<Bound<'_, PyAny>> = None;
+        if needs_start {
+            if must_cancel {
+                // Cancelled before the first step: the coroutine is never
+                // built, so there is nothing to unwind.
+                task.finish(
+                    py,
+                    task_object,
+                    HandlerResponse::internal_error(),
+                    CompletionKind::Cancelled(cancel_message),
+                );
+                return;
+            }
+            if !task.start(py, task_object) {
+                return;
+            }
+        }
+
+        // A wake from a finished future may carry an exception to deliver;
+        // deferred protocol errors and pending cancellations override it.
+        let mut pending_throw: Option<Bound<'_, PyAny>> =
+            deferred_throw.map(|exception| exception.into_bound(py));
         if let Some(future) = finished_future {
             if let Err(wake_error) = future.call_method0(intern!(py, "result")) {
                 pending_throw = Some(wake_error.value(py).clone().into_any());
@@ -412,38 +764,67 @@ impl HandlerTask {
             }
         }
 
+        let (coroutine, context) = {
+            let state = task.lock_state();
+            let coroutine = state
+                .coroutine
+                .as_ref()
+                .map(|coroutine| coroutine.clone_ref(py));
+            let context = state.context.as_ref().map(|context| context.clone_ref(py));
+            match (coroutine, context) {
+                (Some(coroutine), Some(context)) => (coroutine, context),
+                // Unreachable after a successful start; be defensive.
+                _ => return,
+            }
+        };
+
         if let Err(enter_error) = task
+            .loop_handles
             .enter_task
             .bind(py)
-            .call1((&task.event_loop, task_object))
+            .call1((&task.loop_handles.loop_object, task_object))
         {
             enter_error.print(py);
-            task.finish(HandlerResponse::internal_error(), false);
+            task.close_coroutine_quietly(py);
+            task.finish(
+                py,
+                task_object,
+                HandlerResponse::internal_error(),
+                CompletionKind::Aborted,
+            );
             return;
         }
         // SAFETY: `context` is a valid contextvars.Context this task owns;
         // the matching PyContext_Exit below runs before this function
-        // returns, and the context is only ever entered by this loop thread.
-        if unsafe { ffi::PyContext_Enter(task.context.as_ptr()) } != 0 {
+        // returns, and the context is only entered by this loop thread.
+        if unsafe { ffi::PyContext_Enter(context.as_ptr()) } != 0 {
             PyErr::fetch(py).print(py);
             let _ = task
+                .loop_handles
                 .leave_task
                 .bind(py)
-                .call1((&task.event_loop, task_object));
-            task.finish(HandlerResponse::internal_error(), false);
+                .call1((&task.loop_handles.loop_object, task_object));
+            task.close_coroutine_quietly(py);
+            task.finish(
+                py,
+                task_object,
+                HandlerResponse::internal_error(),
+                CompletionKind::Aborted,
+            );
             return;
         }
 
-        task.step_until_suspended(py, task_object, pending_throw);
+        task.step_once(py, task_object, &coroutine, pending_throw);
 
         // SAFETY: balances the successful PyContext_Enter above.
-        if unsafe { ffi::PyContext_Exit(task.context.as_ptr()) } != 0 {
+        if unsafe { ffi::PyContext_Exit(context.as_ptr()) } != 0 {
             PyErr::fetch(py).print(py);
         }
         if let Err(leave_error) = task
+            .loop_handles
             .leave_task
             .bind(py)
-            .call1((&task.event_loop, task_object))
+            .call1((&task.loop_handles.loop_object, task_object))
         {
             leave_error.print(py);
         }
@@ -508,19 +889,165 @@ impl HandlerTask {
     }
 
     fn get_loop(&self, py: Python<'_>) -> Py<PyAny> {
-        self.event_loop.clone_ref(py)
+        self.loop_handles.loop_object.clone_ref(py)
     }
 
-    fn get_name(&self) -> &'static str {
-        "rayo-handler"
+    fn get_coro(&self, py: Python<'_>) -> Option<Py<PyAny>> {
+        self.lock_state()
+            .coroutine
+            .as_ref()
+            .map(|coroutine| coroutine.clone_ref(py))
+    }
+
+    fn get_context(&self, py: Python<'_>) -> Option<Py<PyAny>> {
+        self.lock_state()
+            .context
+            .as_ref()
+            .map(|context| context.clone_ref(py))
+    }
+
+    fn get_name(&self, py: Python<'_>) -> Py<PyAny> {
+        match self.lock_state().name.as_ref() {
+            Some(name) => name.clone_ref(py),
+            None => intern!(py, "rayo-handler").clone().into_any().unbind(),
+        }
+    }
+
+    fn set_name(&self, value: Bound<'_, PyAny>) -> PyResult<()> {
+        let name = value.str()?;
+        self.lock_state().name = Some(name.into_any().unbind());
+        Ok(())
+    }
+
+    /// Future-protocol result: the handler's return value once finished.
+    fn result(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let state = self.lock_state();
+        if !state.finished {
+            return Err(InvalidStateError::new_err(
+                "this request's handler is still running",
+            ));
+        }
+        if state.finished_cancelled {
+            return Err(match state.cancelled_message.as_ref() {
+                Some(message) => CancelledError::new_err((message.clone_ref(py),)),
+                None => CancelledError::new_err(()),
+            });
+        }
+        if let Some(exception) = state.stored_exception.as_ref() {
+            return Err(PyErr::from_value(exception.bind(py).clone()));
+        }
+        Ok(match state.stored_result.as_ref() {
+            Some(return_value) => return_value.clone_ref(py),
+            None => py.None(),
+        })
+    }
+
+    /// Future-protocol exception accessor.
+    fn exception(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        let state = self.lock_state();
+        if !state.finished {
+            return Err(InvalidStateError::new_err(
+                "this request's handler is still running",
+            ));
+        }
+        if state.finished_cancelled {
+            return Err(match state.cancelled_message.as_ref() {
+                Some(message) => CancelledError::new_err((message.clone_ref(py),)),
+                None => CancelledError::new_err(()),
+            });
+        }
+        Ok(state
+            .stored_exception
+            .as_ref()
+            .map(|exception| exception.clone_ref(py)))
+    }
+
+    /// Future-protocol done callbacks (used by tracing/APM integrations via
+    /// `asyncio.current_task().add_done_callback(...)`).
+    #[pyo3(signature = (callback, *, context = None))]
+    fn add_done_callback(
+        task_object: &Bound<'_, Self>,
+        callback: Bound<'_, PyAny>,
+        context: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        let py = task_object.py();
+        let task = task_object.get();
+        let callback_context = match context {
+            Some(explicit_context) => explicit_context,
+            None => {
+                // SAFETY: returns a new strong reference (or null with an
+                // exception set); the thread is attached.
+                let context_pointer = unsafe { ffi::PyContext_CopyCurrent() };
+                if context_pointer.is_null() {
+                    return Err(PyErr::fetch(py));
+                }
+                // SAFETY: the non-null return is a valid new strong reference.
+                unsafe { Bound::from_owned_ptr(py, context_pointer) }
+            }
+        };
+        let fire_immediately = {
+            let mut state = task.lock_state();
+            if state.finished {
+                true
+            } else {
+                state
+                    .done_callbacks
+                    .push((callback.clone().unbind(), callback_context.clone().unbind()));
+                false
+            }
+        };
+        if fire_immediately {
+            let kwargs = PyDict::new(py);
+            kwargs.set_item(intern!(py, "context"), callback_context)?;
+            task.loop_handles.loop_object.bind(py).call_method(
+                intern!(py, "call_soon"),
+                (callback, task_object),
+                Some(&kwargs),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn remove_done_callback(&self, py: Python<'_>, callback: Bound<'_, PyAny>) -> usize {
+        let mut state = self.lock_state();
+        let callbacks_before = state.done_callbacks.len();
+        state
+            .done_callbacks
+            .retain(|(existing_callback, _context)| {
+                !existing_callback.bind(py).eq(&callback).unwrap_or(false)
+            });
+        callbacks_before - state.done_callbacks.len()
+    }
+
+    /// Keep the task ↔ future cycle a parked request forms visible to the
+    /// cycle GC. `loop_handles` is shared through an `Arc` and deliberately
+    /// not visited (see [`LoopHandles`]); skipping fields on a contended
+    /// state lock only delays collection, never breaks it.
+    fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+        visit.call(&self.handler)?;
+        visit.call(&self.handler_kwargs)?;
+        if let Ok(state) = self.state.try_lock() {
+            visit.call(&state.coroutine)?;
+            visit.call(&state.context)?;
+            visit.call(&state.waiting_on)?;
+            visit.call(&state.deferred_throw)?;
+            visit.call(&state.cancel_message)?;
+            visit.call(&state.cancelled_message)?;
+            visit.call(&state.name)?;
+            visit.call(&state.stored_result)?;
+            visit.call(&state.stored_exception)?;
+            for (callback, callback_context) in &state.done_callbacks {
+                visit.call(callback)?;
+                visit.call(callback_context)?;
+            }
+        }
+        Ok(())
     }
 }
 
 /// The Python event-loop thread and the handles needed to schedule onto it.
 pub struct EventLoop {
-    loop_object: Py<PyAny>,
-    enter_task: Py<PyAny>,
-    leave_task: Py<PyAny>,
+    handles: Arc<LoopHandles>,
     thread: Mutex<Option<JoinHandle<()>>>,
     /// Requests scheduled but not yet completed — the load signal for
     /// least-loaded placement, and an ops gauge. Heuristic: `Relaxed`
@@ -534,19 +1061,20 @@ impl EventLoop {
         let asyncio = py.import("asyncio")?;
         let loop_object = asyncio.call_method0("new_event_loop")?;
         let tasks_module = asyncio.getattr("tasks")?;
-        let missing_task_hooks = |attribute_error: PyErr| {
-            PyRuntimeError::new_err(format!(
-                "Rayo needs asyncio.tasks._enter_task/_leave_task to register handler \
-                 tasks with asyncio (present in every CPython since 3.7); this Python \
-                 does not provide them: {attribute_error}"
-            ))
+        let task_hook = |hook_name: &str| {
+            tasks_module.getattr(hook_name).map_err(|attribute_error| {
+                PyRuntimeError::new_err(format!(
+                    "Rayo's scheduler integrates with asyncio through \
+                     asyncio.tasks.{hook_name} (one of CPython's task-extension \
+                     hooks, present since 3.7), which this Python build does not \
+                     provide: {attribute_error}"
+                ))
+            })
         };
-        let enter_task = tasks_module
-            .getattr("_enter_task")
-            .map_err(missing_task_hooks)?;
-        let leave_task = tasks_module
-            .getattr("_leave_task")
-            .map_err(missing_task_hooks)?;
+        let enter_task = task_hook("_enter_task")?;
+        let leave_task = task_hook("_leave_task")?;
+        let register_task = task_hook("_register_task")?;
+        let unregister_task = task_hook("_unregister_task")?;
 
         let loop_for_thread: Py<PyAny> = loop_object.clone().unbind();
         let python_visible_name = thread_name.clone();
@@ -577,9 +1105,14 @@ impl EventLoop {
             })?;
 
         Ok(Self {
-            loop_object: loop_object.unbind(),
-            enter_task: enter_task.unbind(),
-            leave_task: leave_task.unbind(),
+            handles: Arc::new(LoopHandles {
+                loop_object: loop_object.unbind(),
+                enter_task: enter_task.unbind(),
+                leave_task: leave_task.unbind(),
+                register_task: register_task.unbind(),
+                unregister_task: unregister_task.unbind(),
+                live_tasks: Mutex::new(HashMap::new()),
+            }),
             thread: Mutex::new(Some(thread)),
             in_flight: Arc::new(AtomicUsize::new(0)),
         })
@@ -589,9 +1122,9 @@ impl EventLoop {
         self.in_flight.load(Ordering::Relaxed)
     }
 
-    /// Build the handler coroutine and schedule its first step onto the
-    /// event loop. Always resolves the returned request — dispatch failures
-    /// become 500s, never hangs.
+    /// Create the request's task and schedule its first step onto the event
+    /// loop. Always resolves the returned request — dispatch failures become
+    /// 500s, never hangs.
     pub fn schedule(
         &self,
         py: Python<'_>,
@@ -605,41 +1138,14 @@ impl EventLoop {
             in_flight: Arc::clone(&self.in_flight),
         };
 
-        // Calling an async function only builds the coroutine object — no
-        // handler code runs. A failure here is a signature mismatch between
-        // registration and dispatch: a Rayo bug, not a client error.
-        let coroutine = match handler.bind(py).call((), Some(&handler_kwargs)) {
-            Ok(coroutine) => coroutine,
-            Err(call_error) => {
-                call_error.print(py);
-                channel.send(HandlerResponse::internal_error());
-                return DispatchedRequest::failed(response_receiver);
-            }
-        };
-
-        // SAFETY: PyContext_CopyCurrent returns a new strong reference to a
-        // fresh Context (or null with an exception set); the thread is
-        // attached (`py` witnesses it).
-        let context_pointer = unsafe { ffi::PyContext_CopyCurrent() };
-        if context_pointer.is_null() {
-            PyErr::fetch(py).print(py);
-            channel.send(HandlerResponse::internal_error());
-            return DispatchedRequest::failed(response_receiver);
-        }
-        // SAFETY: non-null return from PyContext_CopyCurrent is a valid new
-        // strong reference.
-        let context = unsafe { Bound::from_owned_ptr(py, context_pointer) };
-
         let task = match Py::new(
             py,
             HandlerTask {
-                coroutine: coroutine.unbind(),
-                context: context.unbind(),
-                event_loop: self.loop_object.clone_ref(py),
-                enter_task: self.enter_task.clone_ref(py),
-                leave_task: self.leave_task.clone_ref(py),
+                handler: handler.clone_ref(py),
+                handler_kwargs: handler_kwargs.unbind(),
+                loop_handles: Arc::clone(&self.handles),
                 channel,
-                state: Mutex::new(HandlerTaskState::default()),
+                state: Mutex::new(TaskState::default()),
             },
         ) {
             Ok(task) => task,
@@ -652,31 +1158,59 @@ impl EventLoop {
             }
         };
 
+        // Registered before the first step can possibly run, so the finish
+        // path always finds (and removes) the entry.
+        self.handles
+            .lock_live_tasks()
+            .insert(task.as_ptr() as usize, task.clone_ref(py));
+
         let scheduled = self
+            .handles
             .loop_object
             .bind(py)
             .call_method1(intern!(py, "call_soon_threadsafe"), (&task,));
         if let Err(scheduling_error) = scheduled {
             scheduling_error.print(py);
+            self.handles
+                .lock_live_tasks()
+                .remove(&(task.as_ptr() as usize));
+            // The coroutine is built on the first step, which will never
+            // run — nothing to close.
             task.get().channel.send(HandlerResponse::internal_error());
             return DispatchedRequest::failed(response_receiver);
         }
         DispatchedRequest {
             response_receiver,
             task: Some(task),
-            responded: false,
         }
     }
 
-    /// Stop the loop and join its thread. Idempotent.
-    pub fn stop(&self, py: Python<'_>) {
-        let event_loop = self.loop_object.bind(py);
-        if let Ok(stop_method) = event_loop.getattr("stop") {
-            if let Err(stop_error) = event_loop.call_method1("call_soon_threadsafe", (stop_method,))
-            {
-                stop_error.print(py);
-            }
+    /// Schedule cancellation of every live task on this loop (graceful
+    /// shutdown: handlers unwind, cleanup runs, responses resolve).
+    pub fn cancel_in_flight(&self, py: Python<'_>) {
+        let live_tasks: Vec<Py<HandlerTask>> = {
+            let registry = self.handles.lock_live_tasks();
+            registry.values().map(|task| task.clone_ref(py)).collect()
+        };
+        for task in live_tasks {
+            let scheduled =
+                task.bind(py)
+                    .getattr(intern!(py, "cancel"))
+                    .and_then(|cancel_method| {
+                        self.handles
+                            .loop_object
+                            .bind(py)
+                            .call_method1(intern!(py, "call_soon_threadsafe"), (cancel_method,))
+                    });
+            // A loop that refuses the callback is closing; stop() disposes
+            // of whatever remains.
+            let _closing = scheduled;
         }
+    }
+
+    /// Stop the loop, join its thread, and dispose of any task that can
+    /// never run again. Idempotent.
+    pub fn stop(&self, py: Python<'_>) {
         let thread_handle = {
             let mut thread_slot = self
                 .thread
@@ -684,13 +1218,34 @@ impl EventLoop {
                 .unwrap_or_else(|poisoned_lock| poisoned_lock.into_inner());
             thread_slot.take()
         };
+        // Only the call that wins the join handle stops the loop; later
+        // calls would just be poking a closed loop.
         if let Some(handle) = thread_handle {
+            let event_loop = self.handles.loop_object.bind(py);
+            if let Ok(stop_method) = event_loop.getattr("stop") {
+                if let Err(stop_error) =
+                    event_loop.call_method1("call_soon_threadsafe", (stop_method,))
+                {
+                    stop_error.print(py);
+                }
+            }
             // Detach so the loop thread can re-attach to finish shutting down.
             py.detach(|| {
                 if handle.join().is_err() {
                     eprintln!("rayo-dispatch: event-loop thread panicked during shutdown");
                 }
             });
+        }
+        // Anything still registered after the loop stopped can never be
+        // stepped again: run what cleanup can run and resolve its response,
+        // instead of leaking the coroutine and pinning the gauge.
+        let leftover_tasks: Vec<Py<HandlerTask>> = {
+            let mut registry = self.handles.lock_live_tasks();
+            registry.drain().map(|(_pointer, task)| task).collect()
+        };
+        for task in leftover_tasks {
+            let bound_task = task.bind(py);
+            bound_task.get().dispose(py, bound_task);
         }
     }
 }
@@ -704,7 +1259,6 @@ impl EventLoop {
 pub struct DispatchedRequest {
     response_receiver: oneshot::Receiver<HandlerResponse>,
     task: Option<Py<HandlerTask>>,
-    responded: bool,
 }
 
 impl DispatchedRequest {
@@ -714,7 +1268,6 @@ impl DispatchedRequest {
         Self {
             response_receiver,
             task: None,
-            responded: true,
         }
     }
 
@@ -722,7 +1275,6 @@ impl DispatchedRequest {
     /// without responding (the event loop shut down mid-request).
     pub async fn response(&mut self) -> Option<HandlerResponse> {
         let outcome = (&mut self.response_receiver).await;
-        self.responded = true;
         self.task = None;
         outcome.ok()
     }
@@ -730,9 +1282,6 @@ impl DispatchedRequest {
 
 impl Drop for DispatchedRequest {
     fn drop(&mut self) {
-        if self.responded {
-            return;
-        }
         let Some(task) = self.task.take() else {
             return;
         };
@@ -741,14 +1290,16 @@ impl Drop for DispatchedRequest {
         }
         // The response future was dropped before completion — the client
         // disconnected. Propagate as cancellation onto the loop thread. A
-        // failure here means the loop is closing; nothing left to cancel into.
+        // failure here means the loop is closing; stop() disposes of the
+        // task instead.
         Python::attach(|py| {
             let _scheduled_or_shutting_down = task
                 .bind(py)
                 .getattr(intern!(py, "cancel"))
                 .and_then(|cancel_method| {
                     task.get()
-                        .event_loop
+                        .loop_handles
+                        .loop_object
                         .bind(py)
                         .call_method1(intern!(py, "call_soon_threadsafe"), (cancel_method,))
                 });
@@ -820,7 +1371,15 @@ impl EventLoopPool {
         self.loops[chosen_index].schedule(py, handler, handler_kwargs)
     }
 
-    /// Stop every loop and join its thread. Idempotent.
+    /// Schedule cancellation of every live task on every loop.
+    pub fn cancel_in_flight(&self, py: Python<'_>) {
+        for event_loop in &self.loops {
+            event_loop.cancel_in_flight(py);
+        }
+    }
+
+    /// Stop every loop, join its thread, and dispose of stranded tasks.
+    /// Idempotent.
     pub fn stop(&self, py: Python<'_>) {
         for event_loop in &self.loops {
             event_loop.stop(py);

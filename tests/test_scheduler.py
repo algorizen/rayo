@@ -2,39 +2,39 @@
 
 Handlers run without an ``asyncio.Task``, so the semantics that Task provides
 for free are covered explicitly here: contextvars propagation, cancellation
-(client disconnect unwinds ``finally`` blocks), and Task-protocol
-compatibility (``asyncio.current_task``, ``asyncio.timeout``, ``TaskGroup``).
+(client disconnect unwinds ``finally`` blocks), Task-protocol compatibility
+(``asyncio.current_task``, ``asyncio.all_tasks``, ``asyncio.timeout``,
+``TaskGroup``, done callbacks), and graceful-shutdown draining.
 """
 
 import asyncio
-import json
+import contextlib
+import functools
+import inspect
 import socket
 import struct
 import sys
+import threading
 import time
-import urllib.request
-from collections.abc import Iterator
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Callable, Coroutine, Iterator
 from contextvars import ContextVar
 from typing import Any
 
 import pytest
 from rayo import Rayo
 from rayo._core import Server
+from support import get_json
 
 request_marker: ContextVar[str] = ContextVar("request_marker", default="unset")
 
-# Written by the /slow-with-cleanup handler, read back over /cancellation-record;
-# keyed by request id so tests never see each other's entries.
+# Written by handlers, read back over probe endpoints; keyed by request id so
+# tests never see each other's entries.
 CANCELLATION_RECORDS: dict[str, dict[str, Any]] = {}
+DONE_CALLBACK_RECORDS: dict[str, str] = {}
+DECORATOR_OBSERVATIONS: dict[str, bool] = {}
 
 SUPPORTS_TIMEOUT_AND_TASKGROUP = sys.version_info >= (3, 11)
-
-
-def _get_json(port: int, path: str) -> dict[str, object]:
-    with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=30) as response:
-        payload: dict[str, object] = json.loads(response.read())
-        return payload
+SUPPORTS_MARKCOROUTINEFUNCTION = sys.version_info >= (3, 12)
 
 
 @pytest.fixture(scope="module")
@@ -44,10 +44,14 @@ def running_server() -> Iterator[Server]:
     @app.get("/task-identity")
     async def task_identity() -> dict[str, object]:
         current = asyncio.current_task()
+        assert current is not None
+        current.set_name("scheduler-test-task")
         return {
-            "has_task": current is not None,
             "is_asyncio_task": isinstance(current, asyncio.Task),
-            "task_type": type(current).__name__ if current is not None else None,
+            "task_type": type(current).__name__,
+            "name": current.get_name(),
+            "registered_in_all_tasks": current in asyncio.all_tasks(),
+            "has_coro": current.get_coro() is not None,
         }
 
     @app.get("/context-marker/{marker}")
@@ -66,6 +70,30 @@ def running_server() -> Iterator[Server]:
 
         values = await asyncio.gather(echo_after_sleep(1), echo_after_sleep(2), echo_after_sleep(3))
         return {"values": list(values)}
+
+    @app.get("/done-callback/{request_id}")
+    async def done_callback(request_id: str) -> dict[str, bool]:
+        current = asyncio.current_task()
+        assert current is not None
+
+        def record_completion(finished_task: "asyncio.Task[object]") -> None:
+            DONE_CALLBACK_RECORDS[request_id] = type(finished_task).__name__
+
+        current.add_done_callback(record_completion)
+        return {"registered": True}
+
+    @app.get("/cross-loop-await")
+    async def cross_loop_await() -> dict[str, bool]:
+        foreign_loop = asyncio.new_event_loop()
+        try:
+            foreign_future: asyncio.Future[object] = foreign_loop.create_future()
+            try:
+                await foreign_future
+            except RuntimeError as loop_error:
+                return {"rejected": "different event loop" in str(loop_error)}
+            return {"rejected": False}
+        finally:
+            foreign_loop.close()
 
     @app.get("/slow-with-cleanup/{request_id}")
     async def slow_with_cleanup(request_id: str) -> dict[str, object]:
@@ -127,29 +155,58 @@ def running_server() -> Iterator[Server]:
                 }
             return {"caught": None, "leaves": []}
 
+    if SUPPORTS_MARKCOROUTINEFUNCTION:
+
+        def loop_binding_decorator(
+            handler: Callable[..., Coroutine[Any, Any, dict[str, bool]]],
+        ) -> Callable[..., Coroutine[Any, Any, dict[str, bool]]]:
+            @functools.wraps(handler)
+            def wrapper(**handler_kwargs: object) -> Coroutine[Any, Any, dict[str, bool]]:
+                # Runs before the coroutine exists — only works when the
+                # scheduler builds the handler call on the event-loop thread.
+                DECORATOR_OBSERVATIONS["saw_running_loop"] = asyncio.get_running_loop() is not None
+                return handler(**handler_kwargs)
+
+            return inspect.markcoroutinefunction(wrapper)
+
+        @app.get("/decorated")
+        @loop_binding_decorator
+        async def decorated() -> dict[str, bool]:
+            return {"wrapper_saw_loop": DECORATOR_OBSERVATIONS.get("saw_running_loop", False)}
+
     server = app._start(port=0, loop_threads=1)
     yield server
     server.shutdown()
 
 
 def test_handlers_run_without_an_asyncio_task(running_server: Server) -> None:
-    identity = _get_json(running_server.port, "/task-identity")
-    assert identity["has_task"] is True, "asyncio.current_task() must see the handler task"
+    identity = get_json(running_server.port, "/task-identity")
     assert identity["is_asyncio_task"] is False, "dispatch must not create an asyncio.Task"
     assert identity["task_type"] == "HandlerTask"
 
 
+def test_task_protocol_surface(running_server: Server) -> None:
+    identity = get_json(running_server.port, "/task-identity")
+    assert identity["name"] == "scheduler-test-task"
+    assert identity["registered_in_all_tasks"] is True, (
+        "handler tasks must be visible to asyncio.all_tasks()"
+    )
+    assert identity["has_coro"] is True
+
+
 def test_contextvars_persist_across_both_resume_paths(running_server: Server) -> None:
-    marker = _get_json(running_server.port, "/context-marker/alpha")
+    marker = get_json(running_server.port, "/context-marker/alpha")
     assert marker == {"first": "alpha", "second": "alpha"}
 
 
 def test_contextvars_are_isolated_between_concurrent_requests(running_server: Server) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
     markers = [f"request-{index}" for index in range(8)]
     with ThreadPoolExecutor(max_workers=len(markers)) as request_pool:
         results = list(
             request_pool.map(
-                lambda marker: _get_json(running_server.port, f"/context-marker/{marker}"),
+                lambda marker: get_json(running_server.port, f"/context-marker/{marker}"),
                 markers,
             )
         )
@@ -157,30 +214,51 @@ def test_contextvars_are_isolated_between_concurrent_requests(running_server: Se
 
 
 def test_gather_works_inside_handlers(running_server: Server) -> None:
-    assert _get_json(running_server.port, "/gather") == {"values": [1, 2, 3]}
+    assert get_json(running_server.port, "/gather") == {"values": [1, 2, 3]}
+
+
+def test_done_callbacks_fire_after_completion(running_server: Server) -> None:
+    request_id = "done-callback-test"
+    assert get_json(running_server.port, f"/done-callback/{request_id}") == {"registered": True}
+    callback_deadline = time.perf_counter() + 5
+    while request_id not in DONE_CALLBACK_RECORDS and time.perf_counter() < callback_deadline:
+        time.sleep(0.01)
+    assert DONE_CALLBACK_RECORDS.get(request_id) == "HandlerTask"
+
+
+def test_cross_loop_awaits_are_rejected_with_a_specific_error(running_server: Server) -> None:
+    assert get_json(running_server.port, "/cross-loop-await") == {"rejected": True}
 
 
 @pytest.mark.skipif(
     not SUPPORTS_TIMEOUT_AND_TASKGROUP, reason="asyncio.timeout requires Python 3.11+"
 )
 def test_asyncio_timeout_cancels_and_recovers(running_server: Server) -> None:
-    assert _get_json(running_server.port, "/timeout-guard") == {"timed_out": True}
+    assert get_json(running_server.port, "/timeout-guard") == {"timed_out": True}
 
 
 @pytest.mark.skipif(
     not SUPPORTS_TIMEOUT_AND_TASKGROUP, reason="asyncio.TaskGroup requires Python 3.11+"
 )
 def test_task_group_completes_inside_handlers(running_server: Server) -> None:
-    assert _get_json(running_server.port, "/task-group/3/4") == {"total": 14}
+    assert get_json(running_server.port, "/task-group/3/4") == {"total": 14}
 
 
 @pytest.mark.skipif(
     not SUPPORTS_TIMEOUT_AND_TASKGROUP, reason="asyncio.TaskGroup requires Python 3.11+"
 )
 def test_task_group_child_failure_surfaces_as_exception_group(running_server: Server) -> None:
-    failure = _get_json(running_server.port, "/task-group-failure")
+    failure = get_json(running_server.port, "/task-group-failure")
     assert failure["caught"] in {"ExceptionGroup", "BaseExceptionGroup"}
     assert failure["leaves"] == ["ValueError"]
+
+
+@pytest.mark.skipif(
+    not SUPPORTS_MARKCOROUTINEFUNCTION,
+    reason="inspect.markcoroutinefunction requires Python 3.12+",
+)
+def test_decorator_wrappers_run_on_the_event_loop_thread(running_server: Server) -> None:
+    assert get_json(running_server.port, "/decorated") == {"wrapper_saw_loop": True}
 
 
 def test_client_disconnect_cancels_handler_and_runs_cleanup(running_server: Server) -> None:
@@ -212,3 +290,43 @@ def test_client_disconnect_cancels_handler_and_runs_cleanup(running_server: Serv
     record = CANCELLATION_RECORDS.get(request_id, {})
     assert record.get("cancelled") is True, f"handler was not cancelled on disconnect: {record}"
     assert record.get("cleanup_ran") is True, f"finally block did not run: {record}"
+
+
+def test_shutdown_cancels_parked_handlers_after_grace() -> None:
+    app = Rayo(title="shutdown test")
+    parked_record: dict[str, bool] = {}
+
+    @app.get("/park")
+    async def park() -> dict[str, bool]:
+        parked_record["started"] = True
+        try:
+            await asyncio.sleep(60)
+        finally:
+            parked_record["cleanup_ran"] = True
+        return {"finished": True}
+
+    server = app._start(port=0, loop_threads=1)
+
+    def fire_and_forget() -> None:
+        # A 500 or dropped connection is expected after cancellation.
+        with contextlib.suppress(Exception):
+            get_json(server.port, "/park")
+
+    request_thread = threading.Thread(target=fire_and_forget)
+    request_thread.start()
+    start_deadline = time.perf_counter() + 5
+    while not parked_record.get("started") and time.perf_counter() < start_deadline:
+        time.sleep(0.01)
+    assert parked_record.get("started"), "handler never started; cannot exercise shutdown"
+
+    shutdown_began = time.perf_counter()
+    server.shutdown(grace_seconds=0.2)
+    shutdown_elapsed = time.perf_counter() - shutdown_began
+
+    assert parked_record.get("cleanup_ran") is True, (
+        "shutdown abandoned a parked handler without running its cleanup"
+    )
+    assert shutdown_elapsed < 8, (
+        f"shutdown took {shutdown_elapsed:.1f}s; the grace period is not being enforced"
+    )
+    request_thread.join(timeout=5)

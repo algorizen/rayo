@@ -5,28 +5,21 @@ parallel; on GIL builds the same API works with concurrency but not
 parallelism. Both properties are covered here.
 """
 
-import json
 import sys
 import threading
 import time
-import urllib.request
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from rayo import Rayo
 from rayo._core import Server
+from support import get_json
 
 
 def _is_free_threaded() -> bool:
     gil_check = getattr(sys, "_is_gil_enabled", None)
     return gil_check is not None and not gil_check()
-
-
-def _get_json(port: int, path: str) -> dict[str, object]:
-    with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=30) as response:
-        payload: dict[str, object] = json.loads(response.read())
-        return payload
 
 
 LOOP_THREADS = 4
@@ -62,7 +55,7 @@ def test_rejects_zero_loop_threads() -> None:
 def test_in_flight_gauge_drains_to_zero(running_server: Server) -> None:
     with ThreadPoolExecutor(max_workers=8) as request_pool:
         burst_futures = [
-            request_pool.submit(_get_json, running_server.port, "/burn/20") for _ in range(16)
+            request_pool.submit(get_json, running_server.port, "/burn/20") for _ in range(16)
         ]
         for burst_future in burst_futures:
             burst_future.result()
@@ -77,7 +70,7 @@ def test_in_flight_gauge_drains_to_zero(running_server: Server) -> None:
 
 def test_requests_distribute_across_all_loop_threads(running_server: Server) -> None:
     serving_threads = {
-        str(_get_json(running_server.port, "/loop-thread")["thread"])
+        str(get_json(running_server.port, "/loop-thread")["thread"])
         for _ in range(LOOP_THREADS * 4)
     }
     assert serving_threads == {f"rayo-loop-{index}" for index in range(LOOP_THREADS)}
@@ -91,14 +84,14 @@ def test_cpu_bound_handlers_run_in_parallel_on_free_threaded(running_server: Ser
     burn_ms = 150
 
     solo_started = time.perf_counter()
-    _get_json(running_server.port, f"/burn/{burn_ms}")
+    get_json(running_server.port, f"/burn/{burn_ms}")
     solo_elapsed = time.perf_counter() - solo_started
 
     concurrent_requests = LOOP_THREADS
     concurrent_started = time.perf_counter()
     with ThreadPoolExecutor(max_workers=concurrent_requests) as request_pool:
         request_futures = [
-            request_pool.submit(_get_json, running_server.port, f"/burn/{burn_ms}")
+            request_pool.submit(get_json, running_server.port, f"/burn/{burn_ms}")
             for _ in range(concurrent_requests)
         ]
         for request_future in request_futures:
