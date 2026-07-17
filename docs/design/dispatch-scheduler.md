@@ -25,6 +25,8 @@ Sync handlers: GIL builds → sized thread pool (first-class config: size, queue
 
 Client disconnect → cancellation token → scheduler throws `CancelledError` into the coroutine at its next suspension point. Dependencies with cleanup (context managers) unwind normally. Routes/streams marked `detached=True` swap the token for a completion-tracked handle (see streaming design). Cancellation is **tested behavior**, including: disconnect during validation (never enters Python), during handler await, during response streaming.
 
+**Sync handlers cannot be cancelled mid-run.** A `def` handler runs to completion on its blocking-capable thread regardless of the client's fate — there is no suspension point to deliver `CancelledError` to. If the client is gone by the time it finishes, the response is discarded (the response channel's receiver has dropped) and the thread returns to its pool. This is the same semantics `run_in_executor` gives asyncio, and it is documented user-facing behavior, not an accident: handlers that need cooperative cancellation must be `async`.
+
 ### contextvars
 
 The scheduler captures the context at dispatch and enters it for every step — equivalent to `asyncio.Task` semantics. Request-scoped context (trace IDs, DI request scope) rides contextvars; this is load-bearing for observability integrations and covered by conformance tests.

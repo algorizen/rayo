@@ -1389,6 +1389,12 @@ impl EventLoopPool {
 
 /// Run a sync handler to completion on the current thread (the caller is
 /// responsible for putting this on a blocking-capable thread).
+///
+/// Cancellation semantics, documented user-facing behavior: a sync handler
+/// cannot be cancelled mid-run — there is no suspension point to deliver
+/// `CancelledError` to. On client disconnect it finishes anyway and the
+/// response is discarded (the response channel's receiver is gone). Handlers
+/// that need cooperative cancellation must be `async`.
 pub fn execute_sync_handler(
     handler: &Bound<'_, PyAny>,
     handler_kwargs: &Bound<'_, PyDict>,

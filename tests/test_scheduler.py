@@ -30,6 +30,7 @@ request_marker: ContextVar[str] = ContextVar("request_marker", default="unset")
 # Written by handlers, read back over probe endpoints; keyed by request id so
 # tests never see each other's entries.
 CANCELLATION_RECORDS: dict[str, dict[str, Any]] = {}
+SYNC_HANDLER_RECORDS: dict[str, dict[str, Any]] = {}
 DONE_CALLBACK_RECORDS: dict[str, str] = {}
 DECORATOR_OBSERVATIONS: dict[str, bool] = {}
 
@@ -111,6 +112,14 @@ def running_server() -> Iterator[Server]:
     @app.get("/cancellation-record/{request_id}")
     async def cancellation_record(request_id: str) -> dict[str, object]:
         return {"record": CANCELLATION_RECORDS.get(request_id, {})}
+
+    @app.get("/sync-slow/{request_id}")
+    def sync_slow(request_id: str) -> dict[str, bool]:
+        record = SYNC_HANDLER_RECORDS.setdefault(request_id, {})
+        record["started"] = True
+        time.sleep(0.5)
+        record["finished"] = True
+        return {"finished": True}
 
     if SUPPORTS_TIMEOUT_AND_TASKGROUP:
 
@@ -261,35 +270,75 @@ def test_decorator_wrappers_run_on_the_event_loop_thread(running_server: Server)
     assert get_json(running_server.port, "/decorated") == {"wrapper_saw_loop": True}
 
 
-def test_client_disconnect_cancels_handler_and_runs_cleanup(running_server: Server) -> None:
-    request_id = "disconnect-test"
-
-    with socket.create_connection(("127.0.0.1", running_server.port), timeout=5) as connection:
-        connection.sendall(
-            f"GET /slow-with-cleanup/{request_id} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n".encode()
-        )
-        # Wait until the handler is inside its await before disconnecting.
+def _disconnect_mid_request(port: int, path: str, handler_started: Callable[[], bool]) -> None:
+    """Send a request, wait for its handler to start, then RST the connection
+    (reset instead of FIN so the server sees the disconnect immediately)."""
+    with socket.create_connection(("127.0.0.1", port), timeout=5) as connection:
+        connection.sendall(f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n".encode())
         start_deadline = time.perf_counter() + 5
-        while (
-            not CANCELLATION_RECORDS.get(request_id, {}).get("started")
-            and time.perf_counter() < start_deadline
-        ):
+        while not handler_started() and time.perf_counter() < start_deadline:
             time.sleep(0.01)
-        assert CANCELLATION_RECORDS.get(request_id, {}).get("started"), (
-            "handler never started; cannot exercise disconnect cancellation"
-        )
-        # Reset instead of FIN so the server sees the disconnect immediately.
+        assert handler_started(), "handler never started; cannot exercise the disconnect"
         connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
 
-    cancel_deadline = time.perf_counter() + 10
-    while (
-        not CANCELLATION_RECORDS.get(request_id, {}).get("cleanup_ran")
-        and time.perf_counter() < cancel_deadline
-    ):
+
+def _wait_for(condition: Callable[[], bool], deadline_seconds: float) -> None:
+    deadline = time.perf_counter() + deadline_seconds
+    while not condition() and time.perf_counter() < deadline:
         time.sleep(0.02)
-    record = CANCELLATION_RECORDS.get(request_id, {})
+
+
+def test_client_disconnect_cancels_handler_and_runs_cleanup(running_server: Server) -> None:
+    request_id = "disconnect-test"
+    record = CANCELLATION_RECORDS.setdefault(request_id, {})
+
+    _disconnect_mid_request(
+        running_server.port,
+        f"/slow-with-cleanup/{request_id}",
+        lambda: bool(record.get("started")),
+    )
+
+    _wait_for(lambda: bool(record.get("cleanup_ran")), 10)
     assert record.get("cancelled") is True, f"handler was not cancelled on disconnect: {record}"
     assert record.get("cleanup_ran") is True, f"finally block did not run: {record}"
+
+
+def test_in_flight_gauge_drains_after_disconnect_cancellation(running_server: Server) -> None:
+    request_id = "disconnect-gauge-test"
+    record = CANCELLATION_RECORDS.setdefault(request_id, {})
+
+    _disconnect_mid_request(
+        running_server.port,
+        f"/slow-with-cleanup/{request_id}",
+        lambda: bool(record.get("started")),
+    )
+
+    _wait_for(lambda: bool(record.get("cancelled")), 10)
+    assert record.get("cancelled") is True, f"handler was not cancelled on disconnect: {record}"
+    # The cancelled request must release its slot in the ops gauge, exactly
+    # like a completed one.
+    _wait_for(lambda: running_server.in_flight == 0, 5)
+    assert running_server.in_flight == 0, (
+        "a cancelled request left the in-flight gauge pinned above zero"
+    )
+
+
+def test_sync_handlers_finish_and_discard_on_disconnect(running_server: Server) -> None:
+    request_id = "sync-disconnect-test"
+    record = SYNC_HANDLER_RECORDS.setdefault(request_id, {})
+
+    _disconnect_mid_request(
+        running_server.port,
+        f"/sync-slow/{request_id}",
+        lambda: bool(record.get("started")),
+    )
+
+    # Documented semantics: no suspension point exists to cancel a sync
+    # handler at, so it runs to completion and the response is discarded.
+    _wait_for(lambda: bool(record.get("finished")), 10)
+    assert record.get("finished") is True, (
+        f"sync handler did not run to completion after disconnect: {record}"
+    )
 
 
 def test_shutdown_cancels_parked_handlers_after_grace() -> None:
