@@ -7,6 +7,7 @@
 //! creation on the response serialization path.
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use bytes::Bytes;
 use http_body_util::Full;
@@ -168,9 +169,11 @@ impl RequestService for AppService {
 
         if route.is_async {
             // The single attach for this request: build inputs, hand the
-            // coroutine to the event loop, leave. The response arrives as
-            // bytes through the channel.
-            let response_receiver =
+            // handler coroutine to the scheduler, leave. The response arrives
+            // as bytes through the channel. If Hyper drops the future before
+            // it resolves (client disconnect), dropping the dispatched
+            // request cancels the handler.
+            let dispatch_outcome =
                 Python::attach(
                     |py| match self.build_kwargs(py, route, &route_match.path_params) {
                         Ok(kwargs) => Ok(self.event_loops.schedule(py, &route.handler, kwargs)),
@@ -178,10 +181,10 @@ impl RequestService for AppService {
                     },
                 );
             Box::pin(async move {
-                match response_receiver {
-                    Ok(receiver) => match receiver.await {
-                        Ok(handler_response) => response_from_handler(handler_response),
-                        Err(_sender_dropped) => plain_response(
+                match dispatch_outcome {
+                    Ok(mut dispatched_request) => match dispatched_request.response().await {
+                        Some(handler_response) => response_from_handler(handler_response),
+                        None => plain_response(
                             StatusCode::INTERNAL_SERVER_ERROR,
                             "Internal Server Error",
                         ),
@@ -267,6 +270,12 @@ fn convert_and_insert(
     })
 }
 
+/// How long `shutdown()` waits for in-flight requests to finish naturally
+/// before cancelling them, when no explicit grace period is given.
+const DEFAULT_SHUTDOWN_GRACE_SECONDS: f64 = 30.0;
+/// How long cancelled handlers get to unwind and resolve their responses.
+const CANCELLED_DRAIN_SECONDS: f64 = 5.0;
+
 /// A running Rayo server. Frozen and fully `Sync`: usable from any thread on
 /// free-threaded builds.
 #[pyclass(frozen)]
@@ -276,6 +285,55 @@ struct Server {
     shutdown_sender: watch::Sender<bool>,
     serve_finished: Mutex<Option<oneshot::Receiver<()>>>,
     service: Arc<AppService>,
+}
+
+impl Server {
+    /// Stop accepting, drain in-flight requests within the grace period,
+    /// cancel whatever is still running, stop the event loops. Idempotent;
+    /// every blocking wait detaches so loop threads stay able to attach.
+    fn shutdown_impl(&self, py: Python<'_>, grace_seconds: Option<f64>) {
+        let _ = self.shutdown_sender.send(true);
+        let finished_receiver = {
+            let mut finished_slot = self
+                .serve_finished
+                .lock()
+                .unwrap_or_else(|poisoned_lock| poisoned_lock.into_inner());
+            finished_slot.take()
+        };
+        if let Some(mut receiver) = finished_receiver {
+            let natural_grace = Duration::from_secs_f64(
+                grace_seconds
+                    .unwrap_or(DEFAULT_SHUTDOWN_GRACE_SECONDS)
+                    .max(0.0),
+            );
+            let drained_naturally = py.detach(|| {
+                self.runtime.block_on(async {
+                    tokio::time::timeout(natural_grace, &mut receiver)
+                        .await
+                        .is_ok()
+                })
+            });
+            if !drained_naturally {
+                // Grace expired with handlers still running: cancel them so
+                // their cleanup executes and the connection drain can end.
+                self.service.event_loops.cancel_in_flight(py);
+                let drained_after_cancel = py.detach(|| {
+                    self.runtime.block_on(async {
+                        tokio::time::timeout(
+                            Duration::from_secs_f64(CANCELLED_DRAIN_SECONDS),
+                            &mut receiver,
+                        )
+                        .await
+                        .is_ok()
+                    })
+                });
+                if !drained_after_cancel {
+                    eprintln!("rayo: shutdown is proceeding with connections still draining");
+                }
+            }
+        }
+        self.service.event_loops.stop(py);
+    }
 }
 
 #[pymethods]
@@ -304,25 +362,24 @@ impl Server {
                 }
             });
         });
-        self.shutdown(py);
+        self.shutdown_impl(py, None);
     }
 
-    /// Stop accepting, drain in-flight requests, stop the event loop. Idempotent.
-    fn shutdown(&self, py: Python<'_>) {
-        let _ = self.shutdown_sender.send(true);
-        let finished_receiver = {
-            let mut finished_slot = self
-                .serve_finished
-                .lock()
-                .unwrap_or_else(|poisoned_lock| poisoned_lock.into_inner());
-            finished_slot.take()
-        };
-        if let Some(receiver) = finished_receiver {
-            py.detach(|| {
-                let _ = self.runtime.block_on(receiver);
-            });
-        }
-        self.service.event_loops.stop(py);
+    /// Graceful shutdown: in-flight requests get `grace_seconds` (default
+    /// 30) to finish, then are cancelled so their cleanup runs. Idempotent.
+    #[pyo3(signature = (grace_seconds = None))]
+    fn shutdown(&self, py: Python<'_>, grace_seconds: Option<f64>) {
+        self.shutdown_impl(py, grace_seconds);
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        // Reached without an explicit shutdown() when the Server object is
+        // collected. Zero grace disposes of stragglers immediately, and the
+        // detached waits inside keep this safe with the GIL held — the tokio
+        // workers it waits on may themselves need to attach.
+        Python::attach(|py| self.shutdown_impl(py, Some(0.0)));
     }
 }
 
@@ -422,6 +479,7 @@ fn _core(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(core_version, module)?)?;
     module.add_function(wrap_pyfunction!(start_server, module)?)?;
     module.add_class::<Server>()?;
+    module.add_class::<rayo_dispatch::HandlerTask>()?;
     Ok(())
 }
 
