@@ -46,6 +46,29 @@ jobs:
           enable-cache: false
       - run: cargo test --workspace
 
+  dispatch-budget:
+    name: Dispatch boundary budget (${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The budget must hold on BOTH interpreter builds (ADR-0002).
+        python: ["3.12", "3.14t"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python }}
+          enable-cache: false
+      - name: Point pyo3 at the matrix interpreter
+        # The gate embeds Python: pyo3 must build against — and the test
+        # binary must find at runtime — this interpreter's libpython.
+        run: |
+          python_binary="$(uv python find ${{ matrix.python }})"
+          echo "PYO3_PYTHON=${python_binary}" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$("${python_binary}" -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')" >> "$GITHUB_ENV"
+      - run: cargo test --release -p rayo-dispatch --test boundary_budget -- --ignored --nocapture
+
   python-tests:
     name: Python ${{ matrix.python }} (${{ matrix.os }})
     strategy:
