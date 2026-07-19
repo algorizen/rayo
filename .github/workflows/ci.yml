@@ -46,6 +46,37 @@ jobs:
           enable-cache: false
       - run: cargo test --workspace
 
+  dispatch-budget:
+    name: Dispatch boundary budget (${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The budget must hold on BOTH interpreter builds (ADR-0002).
+        python: ["3.12", "3.14t"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python }}
+          enable-cache: false
+      - name: Point pyo3 at the matrix interpreter
+        # The gate embeds Python: pyo3 must build against — and the test
+        # binary must find at runtime — this interpreter's libpython. The
+        # explicit install matters: `uv python find` does not download, and
+        # free-threaded builds are never preinstalled on runners.
+        run: |
+          uv python install ${{ matrix.python }}
+          python_binary="$(uv python find ${{ matrix.python }})"
+          echo "PYO3_PYTHON=${python_binary}" >> "$GITHUB_ENV"
+          python_libdir="$("${python_binary}" -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR") or "")')"
+          if [ -z "${python_libdir}" ]; then
+            echo "sysconfig reports no LIBDIR for ${python_binary}; cannot locate libpython for the test binary" >&2
+            exit 1
+          fi
+          echo "LD_LIBRARY_PATH=${python_libdir}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" >> "$GITHUB_ENV"
+      - run: cargo test --release -p rayo-dispatch --test boundary_budget -- --ignored --nocapture
+
   python-tests:
     name: Python ${{ matrix.python }} (${{ matrix.os }})
     strategy:
