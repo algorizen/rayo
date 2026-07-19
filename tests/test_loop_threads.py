@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 from rayo import Rayo
 from rayo._core import Server
-from support import get_json
+from support import get_json, wait_until
 
 
 def _is_free_threaded() -> bool:
@@ -62,10 +62,10 @@ def test_in_flight_gauge_drains_to_zero(running_server: Server) -> None:
 
     # The gauge decrements on the loop thread as each completion callback
     # runs, which can trail the client seeing its response; poll briefly.
-    drain_deadline = time.perf_counter() + 5
-    while running_server.in_flight != 0 and time.perf_counter() < drain_deadline:
-        time.sleep(0.01)
-    assert running_server.in_flight == 0
+    wait_until(
+        lambda: running_server.in_flight == 0,
+        lambda: f"in-flight gauge stuck at {running_server.in_flight} after the burst drained",
+    )
 
 
 def test_requests_distribute_across_all_loop_threads(running_server: Server) -> None:
