@@ -34,7 +34,7 @@ Enforced by CI (`ruff`, `mypy --strict`, `cargo fmt --check`, `cargo clippy -D w
 - Rust: unit tests per crate; boundary behavior integration-tested from Python (that's what users experience).
 - Python: pytest; every public behavior has a test; conformance suite (`conformance/`) runs on every PR.
 - Both run against GIL and free-threaded interpreters in CI. A test that only passes on one build is a bug.
-- Benchmarks are not tests: they live in `benchmarks/` and follow the [benchmark policy](benchmarks-policy.md).
+- Benchmarks are not tests: they live in `benchmarks/` and follow the [benchmark policy](benchmarks-policy.md). One carve-out: an internal CI regression gate may live in a crate's `tests/` when it is `#[ignore]`d under a plain `cargo test`, gates on a machine-cancelling ratio rather than wall-clock time, and publishes no absolute numbers (e.g. the dispatch boundary-budget gate).
 
 ## Commit messages
 

@@ -69,7 +69,12 @@ jobs:
           uv python install ${{ matrix.python }}
           python_binary="$(uv python find ${{ matrix.python }})"
           echo "PYO3_PYTHON=${python_binary}" >> "$GITHUB_ENV"
-          echo "LD_LIBRARY_PATH=$("${python_binary}" -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')" >> "$GITHUB_ENV"
+          python_libdir="$("${python_binary}" -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR") or "")')"
+          if [ -z "${python_libdir}" ]; then
+            echo "sysconfig reports no LIBDIR for ${python_binary}; cannot locate libpython for the test binary" >&2
+            exit 1
+          fi
+          echo "LD_LIBRARY_PATH=${python_libdir}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" >> "$GITHUB_ENV"
       - run: cargo test --release -p rayo-dispatch --test boundary_budget -- --ignored --nocapture
 
   python-tests:
