@@ -223,6 +223,11 @@ impl RequestService for AppService {
                     }
                     rayo_dispatch::execute_sync_handler(handler.bind(py), &kwargs)
                 });
+                // The ignored error is the documented "finish and discard"
+                // half of sync-handler disconnect semantics (see
+                // `execute_sync_handler` in rayo-dispatch): a disconnected
+                // client drops the receiver, and the completed response is
+                // silently discarded — never logged, never a panic.
                 let _ = response_sender.send(handler_response);
             });
             Box::pin(async move {
